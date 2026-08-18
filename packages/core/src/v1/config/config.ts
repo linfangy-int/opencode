@@ -164,6 +164,10 @@ export const Info = Schema.Struct({
       reserved: Schema.optional(NonNegativeInt).annotate({
         description: "Token buffer for compaction. Leaves enough window to avoid overflow during compaction.",
       }),
+      prompt: Schema.optional(Schema.String).annotate({
+        description:
+          "Custom prompt that replaces the built-in compaction summary instructions. Supports {file:./path} substitution to load the prompt from a file.",
+      }),
     }),
   ),
   experimental: Schema.optional(
@@ -178,6 +182,10 @@ export const Info = Schema.Struct({
       }),
       continue_loop_on_deny: Schema.optional(Schema.Boolean).annotate({
         description: "Continue the agent loop when a tool call is denied",
+      }),
+      omit_model_identity: Schema.optional(Schema.Boolean).annotate({
+        description:
+          "Omit the model identity line ('You are powered by...') from the system prompt environment block. Defaults to false; the minimal tier omits the line regardless unless this is explicitly set to false.",
       }),
       mcp_timeout: Schema.optional(PositiveInt).annotate({
         description: "Timeout in milliseconds for model context protocol (MCP) requests",

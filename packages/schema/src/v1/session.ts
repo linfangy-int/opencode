@@ -350,6 +350,9 @@ export const User = Schema.Struct({
     variant: Schema.optional(Schema.String),
   }),
   system: Schema.optional(Schema.String),
+  // W6-6: files this turn is expected to produce. Carried on the message so the
+  // prompt loop can check them at the point it would otherwise go idle.
+  expected_artifacts: Schema.optional(Schema.Array(Schema.String)),
   tools: Schema.optional(Schema.Record(Schema.String, Schema.Boolean)),
 }).annotate({ identifier: "UserMessage" })
 export type User = Types.DeepMutable<Schema.Schema.Type<typeof User>>
@@ -653,6 +656,10 @@ export const Error = define({
   schema: {
     sessionID: Schema.optional(SessionID),
     error: Assistant.fields.error,
+    // D5: when the erroring turn had already completed file-writing tool
+    // parts, the count is included so consumers don't misread the turn as
+    // having produced nothing.
+    parts_written: Schema.optional(Schema.Finite),
   },
 })
 

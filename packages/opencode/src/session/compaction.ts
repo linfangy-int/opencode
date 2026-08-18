@@ -14,13 +14,14 @@ import { NotFoundError } from "@/storage/storage"
 
 import { Effect, Layer, Context } from "effect"
 import { InstanceState } from "@/effect/instance-state"
-import { isOverflow as overflow, usable } from "./overflow"
+import { isOverflow as overflow, overflowReport, usable, shouldWarnUnsetLimit, DEFAULT_USABLE_CONTEXT } from "./overflow"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { buildPrompt } from "@opencode-ai/core/session/compaction"
+import { SessionBudgetEvent } from "@opencode-ai/schema/session-budget-event"
 import { SessionCompactionEvent } from "@opencode-ai/schema/session-compaction-event"
 
 export const Event = SessionCompactionEvent
@@ -166,6 +167,7 @@ export interface Interface {
   readonly isOverflow: (input: {
     tokens: SessionV1.Assistant["tokens"]
     model: Provider.Model
+    sessionID?: SessionID
   }) => Effect.Effect<boolean>
   readonly prune: (input: { sessionID: SessionID }) => Effect.Effect<void>
   readonly process: (input: {
@@ -203,13 +205,33 @@ const layer = Layer.effect(
     const isOverflow = Effect.fn("SessionCompaction.isOverflow")(function* (input: {
       tokens: SessionV1.Assistant["tokens"]
       model: Provider.Model
+      sessionID?: SessionID
     }) {
-      return overflow({
-        cfg: yield* config.get(),
+      const cfg = yield* config.get()
+      if (input.sessionID && shouldWarnUnsetLimit({ cfg, model: input.model, sessionID: input.sessionID })) {
+        yield* Effect.logWarning("model reports no context limit; assuming conservative usable window", {
+          providerID: input.model.providerID,
+          modelID: input.model.id,
+          usable: DEFAULT_USABLE_CONTEXT,
+        })
+      }
+      const check = {
+        cfg,
         tokens: input.tokens,
         model: input.model,
         outputTokenMax: flags.outputTokenMax,
-      })
+        sessionID: input.sessionID,
+      }
+      const result = overflow(check)
+      // D3: every positive overflow gate decision is visible on the bus.
+      if (result && input.sessionID) {
+        yield* events.publish(SessionBudgetEvent.OverflowDetected, {
+          sessionID: input.sessionID,
+          ...overflowReport(check),
+          action: "compact",
+        })
+      }
+      return result
     })
 
     const estimate = Effect.fn("SessionCompaction.estimate")(function* (input: {
@@ -296,7 +318,10 @@ const layer = Layer.effect(
           if (part.state.status !== "completed") continue
           if (PRUNE_PROTECTED_TOOLS.includes(part.tool)) continue
           if (part.state.time.compacted) break loop
-          const estimate = Token.estimate(part.state.output)
+          // C4: tool outputs with a known source filename estimate at the
+          // file format's real token density instead of the prose default.
+          const filePath = part.state.input["filePath"]
+          const estimate = Token.estimate(part.state.output, typeof filePath === "string" ? filePath : undefined)
           total += estimate
           if (total <= PRUNE_PROTECT) continue
           pruned += estimate
@@ -364,11 +389,15 @@ const layer = Layer.effect(
       const prior = completedCompactions(history)
       const hidden = new Set(prior.flatMap((item) => [item.userIndex, item.assistantIndex]))
       const previousSummary = prior.at(-1)?.summary
+      const visible = history.filter((_, index) => !hidden.has(index))
       const selected = yield* select({
-        messages: history.filter((_, index) => !hidden.has(index)),
+        messages: visible,
         cfg,
         model,
       })
+      // D3: compaction lifecycle with token figures for thrash observability.
+      const beforeTokens = yield* estimate({ messages: visible, model })
+      yield* events.publish(Event.Started, { sessionID: input.sessionID, before_tokens: beforeTokens })
       // Allow plugins to inject context or replace compaction prompt.
       const compacting = yield* plugin.trigger(
         "experimental.session.compacting",
@@ -378,8 +407,11 @@ const layer = Layer.effect(
       const msgs = structuredClone(selected.head)
       yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
       const conversation = msgs.map(serialize).filter(Boolean).join("\n\n")
+      // Plugin prompt keeps precedence; compaction.prompt config replaces the
+      // built-in summary template ({file:./path} is expanded at config load).
+      const override = compacting.prompt ?? cfg.compaction?.prompt
       const nextPrompt =
-        compacting.prompt ??
+        override ??
         [
           buildPrompt({
             previousSummary,
@@ -434,10 +466,7 @@ const layer = Layer.effect(
             content: [
               {
                 type: "text",
-                text: [
-                  nextPrompt,
-                  ...(compacting.prompt ? ["The following is the conversation history:", conversation] : []),
-                ]
+                text: [nextPrompt, ...(override ? ["The following is the conversation history:", conversation] : [])]
                   .filter(Boolean)
                   .join("\n\n"),
               },
@@ -524,9 +553,22 @@ const layer = Layer.effect(
               agent: userMessage.agent,
               model: userMessage.model,
             })
+            // Only blame media when media parts were actually dropped with the
+            // compacted head; text-only overflows get the truthful cause.
+            const hadMedia = selected.head.some((item) =>
+              item.parts.some(
+                (part) =>
+                  (part.type === "file" && MessageV2.isMedia(part.mime)) ||
+                  (part.type === "tool" &&
+                    part.state.status === "completed" &&
+                    (part.state.attachments ?? []).some((attachment) => MessageV2.isMedia(attachment.mime))),
+              ),
+            )
             const text =
               (input.overflow
-                ? "The previous request exceeded the provider's size limit due to large media attachments. The conversation was compacted and media files were removed from context. If the user was asking about attached images or files, explain that the attachments were too large to process and suggest they try again with smaller or fewer files.\n\n"
+                ? hadMedia
+                  ? "The previous request exceeded the provider's size limit due to large media attachments. The conversation was compacted and media files were removed from context. If the user was asking about attached images or files, explain that the attachments were too large to process and suggest they try again with smaller or fewer files.\n\n"
+                  : "The conversation exceeded the model's context window and was compacted. Do not mention attachments to the user; there were none.\n\n"
                 : "") +
               "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed."
             yield* session.updatePart({
@@ -552,6 +594,14 @@ const layer = Layer.effect(
       if (processor.message.error) return "stop"
       if (result === "continue") {
         yield* events.publish(Event.Compacted, { sessionID: input.sessionID })
+        // after_tokens approximates the retained tail; the fresh summary text
+        // is not counted (see the event schema note).
+        const tail = visible.slice(selected.head.length)
+        yield* events.publish(Event.Completed, {
+          sessionID: input.sessionID,
+          before_tokens: beforeTokens,
+          after_tokens: tail.length ? yield* estimate({ messages: tail, model }) : 0,
+        })
       }
       return result
     })

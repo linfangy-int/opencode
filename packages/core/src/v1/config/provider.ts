@@ -61,6 +61,36 @@ export const Model = Schema.Struct({
   ),
   experimental: Schema.optional(Schema.Boolean),
   status: Schema.optional(ModelStatus),
+  tier: Schema.optional(
+    Schema.Literals(["minimal", "default"]).annotate({
+      description:
+        "Capability tier for this model. Overrides the built-in size heuristic; frontier family models resolve their vendor behavior when unset.",
+    }),
+  ),
+  tier_tools: Schema.optional(
+    Schema.Struct({
+      include: Schema.optional(Schema.mutable(Schema.Array(Schema.String))),
+      exclude: Schema.optional(Schema.mutable(Schema.Array(Schema.String))),
+    }).annotate({
+      description:
+        "Adjust the minimal tier's tool roster for this model. `include` keeps additional tool ids through the tier cut (use it for host-integration tools registered by an embedding product); `exclude` drops ids from the built-in roster. Ignored on every other tier.",
+    }),
+  ),
+  prompt: Schema.optional(
+    Schema.String.annotate({
+      description:
+        "Replace the model-family system prompt with this text. Use {file:./path} to load it from a file resolved relative to the config file.",
+    }),
+  ),
+  sampling: Schema.optional(
+    Schema.Struct({
+      temperature: Schema.optional(Schema.Finite),
+      topP: Schema.optional(Schema.Finite),
+      topK: Schema.optional(Schema.Finite),
+    }).annotate({
+      description: "Sampling defaults for this model. Consulted before the built-in per-family sampling ladders.",
+    }),
+  ),
   provider: Schema.optional(
     Schema.Struct({ npm: Schema.optional(Schema.String), api: Schema.optional(Schema.String) }),
   ),

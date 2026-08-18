@@ -17,6 +17,7 @@ import { SystemPrompt } from "./system"
 import { Instruction } from "./instruction"
 import { Plugin } from "../plugin"
 import { MAX_STEPS_PROMPT } from "@opencode-ai/core/session/runner/max-steps"
+import { TurnBudget } from "./turn-budget"
 import { ToolRegistry } from "@/tool/registry"
 import { MCP } from "../mcp"
 import { LSP } from "@/lsp/lsp"
@@ -55,6 +56,7 @@ import { eq } from "drizzle-orm"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
+import { SessionTurnEvent } from "@opencode-ai/schema/session-turn-event"
 import { LLMEvent } from "@opencode-ai/llm"
 
 // @ts-ignore
@@ -666,6 +668,7 @@ const layer = Layer.effect(
           variant,
         },
         system: input.system,
+        expected_artifacts: input.expected_artifacts ? [...input.expected_artifacts] : undefined,
         format: input.format,
       }
 
@@ -1078,11 +1081,87 @@ const layer = Layer.effect(
       throw new Error("Impossible")
     })
 
-    const runLoop: (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
+    // D5: terminal reconciliation event on every runLoop exit path (break,
+    // error, abort). Additive — session status semantics stay untouched; the
+    // event lets consumers reconcile status against what the turn actually
+    // wrote (parts_written counts completed file-writing tool parts).
+    const emitTurnCompleted = Effect.fnUntraced(function* (sessionID: SessionID, exit: Exit.Exit<unknown, unknown>) {
+      const msgs = yield* sessions
+        .messages({ sessionID })
+        .pipe(Effect.catch(() => Effect.succeed<SessionV1.WithParts[]>([])))
+      const lastUser = msgs.findLast((m) => m.info.role === "user")
+      const turn = lastUser
+        ? msgs.filter((m) => m.info.role === "assistant" && m.info.parentID === lastUser.info.id)
+        : []
+      const written = turn
+        .flatMap((m) => m.parts)
+        .filter(
+          (part) =>
+            part.type === "tool" &&
+            SessionProcessor.FILE_WRITING_TOOLS.has(part.tool) &&
+            part.state.status === "completed",
+        ).length
+      const last = turn.at(-1)?.info
+      const assistantError = last?.role === "assistant" ? last.error : undefined
+      const exitError = Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined
+      const lastError = assistantError
+        ? ((assistantError.data as { message?: string } | undefined)?.message ?? assistantError.name)
+        : exitError instanceof Error
+          ? exitError.message
+          : exitError !== undefined
+            ? String(exitError)
+            : undefined
+      yield* events
+        .publish(SessionTurnEvent.Completed, {
+          sessionID,
+          status: assistantError || exitError ? "error" : "idle",
+          parts_written: written,
+          ...(lastError ? { last_error: lastError } : {}),
+        })
+        .pipe(Effect.ignore)
+    })
+
+    // W6-6: which declared artifacts do not exist on disk. Relative paths
+    // resolve against the session directory. Anything that cannot be stat'd is
+    // reported as missing — a path the agent cannot reach is not delivered
+    // either, and a false "missing" costs one nudge while a false "present"
+    // silently accepts an undelivered turn.
+    const missingArtifacts = Effect.fn("SessionPrompt.missingArtifacts")(function* (
+      user: SessionV1.User,
+      directory: string,
+    ) {
+      const expected = user.expected_artifacts ?? []
+      if (expected.length === 0) return [] as string[]
+      const checked = yield* Effect.forEach(
+        expected,
+        Effect.fnUntraced(function* (item: string) {
+          const resolved = path.isAbsolute(item) ? item : path.join(directory, item)
+          const stat = yield* fsys.stat(resolved).pipe(Effect.catch(() => Effect.succeed(undefined)))
+          return stat ? undefined : item
+        }),
+        { concurrency: "unbounded" },
+      )
+      return checked.filter((item): item is string => item !== undefined)
+    })
+
+    const runLoop = (sessionID: SessionID) =>
+      runLoopInner(sessionID).pipe(Effect.onExit((exit) => emitTurnCompleted(sessionID, exit)))
+
+    const runLoopInner: (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
       function* (sessionID: SessionID) {
         const ctx = yield* InstanceState.context
         let structured: unknown
         let step = 0
+        // W6-3: turn spend so far, for the token/wall-clock budgets below.
+        let turnTokens = 0
+        const turnStarted = Date.now()
+        // W6-6: the deliverable nudge fires at most once per turn.
+        let nudged = false
+        // W6-3: set once a budget forces the text-only final step.
+        let budgetStopped = false
+        // A verdict from a previous turn on this session must not be read as
+        // this turn's outcome.
+        TurnBudget.clear(sessionID)
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
 
         while (true) {
@@ -1125,6 +1204,50 @@ const layer = Layer.effect(
                 callID: orphan.callID,
               })
             }
+            // W6-6: a turn can finish cleanly, report success, and never write
+            // the file it was asked for — the model narrates the work instead of
+            // doing it, and "idle" is indistinguishable from "delivered". When
+            // the caller declared what this turn should produce, check before
+            // going idle and say plainly what is missing.
+            //
+            // Exactly one nudge per turn. A model that ignores the first will
+            // ignore the second, and retrying would turn a bad turn into an
+            // expensive one.
+            // Skip the nudge when a budget already forced the text-only step:
+            // that turn has no tools left, so asking it to write a file would
+            // spend another request on something it cannot do.
+            const missing = budgetStopped ? [] : yield* missingArtifacts(lastUser, ctx.directory)
+            if (missing.length > 0 && !nudged) {
+              nudged = true
+              yield* Effect.logInfo("expected artifacts missing", {
+                "session.id": sessionID,
+                missing: missing.join(", "),
+              })
+              const nudgeMsg: SessionV1.User = {
+                id: MessageID.ascending(),
+                sessionID,
+                time: { created: Date.now() },
+                role: "user",
+                agent: lastUser.agent,
+                model: lastUser.model,
+              }
+              yield* sessions.updateMessage(nudgeMsg)
+              yield* sessions.updatePart({
+                id: PartID.ascending(),
+                messageID: nudgeMsg.id,
+                sessionID,
+                type: "text",
+                text: [
+                  `This turn was expected to produce ${missing.length === 1 ? "a file that does not exist" : "files that do not exist"}:`,
+                  ...missing.map((item) => `- ${item}`),
+                  "",
+                  "Describing the work is not the same as doing it. Write the file now, at exactly that path, then stop.",
+                ].join("\n"),
+                synthetic: true,
+              } satisfies SessionV1.TextPart)
+              continue
+            }
+
             yield* Effect.logInfo("exiting loop", { "session.id": sessionID })
             break
           }
@@ -1161,7 +1284,7 @@ const layer = Layer.effect(
           if (
             lastFinished &&
             lastFinished.summary !== true &&
-            (yield* compaction.isOverflow({ tokens: lastFinished.tokens, model }))
+            (yield* compaction.isOverflow({ tokens: lastFinished.tokens, model, sessionID }))
           ) {
             yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true })
             continue
@@ -1175,8 +1298,44 @@ const layer = Layer.effect(
             yield* events.publish(Session.Event.Error, { sessionID, error: error.toObject() })
             throw error
           }
+          // W6-3: `steps` alone does not bound a turn. A step that reads a
+          // large file can cost more than twenty small ones, and the observed
+          // runaway shape is a turn that stays under the step limit while
+          // burning millions of tokens until the provider times out. Token and
+          // wall-clock budgets reuse the B1 structural stop rather than adding
+          // a second termination path: whichever budget trips first, the next
+          // request goes out with the max-steps directive and no tools.
           const maxSteps = agent.steps ?? Infinity
-          const isLastStep = step >= maxSteps
+          const maxTurnTokens = agent.turnTokens ?? Infinity
+          const maxTurnSeconds = agent.turnSeconds ?? Infinity
+          const elapsedSeconds = (Date.now() - turnStarted) / 1000
+          const stopReason: TurnBudget.StopReason | undefined =
+            step >= maxSteps
+              ? "max_steps"
+              : turnTokens >= maxTurnTokens
+                ? "turn_tokens"
+                : elapsedSeconds >= maxTurnSeconds
+                  ? "turn_seconds"
+                  : undefined
+          const isLastStep = stopReason !== undefined
+          if (stopReason) {
+            budgetStopped = true
+            // W6-5: remember why, so a parent agent reading this session's
+            // result can distinguish "done" from "out of budget".
+            TurnBudget.record(sessionID, {
+              reason: stopReason,
+              steps: step,
+              tokens: turnTokens,
+              seconds: Math.round(elapsedSeconds),
+            })
+            yield* Effect.logInfo("turn budget exhausted", {
+              "session.id": sessionID,
+              reason: stopReason,
+              step,
+              turn_tokens: turnTokens,
+              elapsed_seconds: Math.round(elapsedSeconds),
+            })
+          }
           msgs = yield* SessionReminders.apply({ messages: msgs, agent, session }).pipe(
             Effect.provideService(RuntimeFlags.Service, flags),
             Effect.provideService(FSUtil.Service, fsys),
@@ -1269,6 +1428,15 @@ const layer = Layer.effect(
             ]
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
+            // D2: the same roster the task tool description advertises
+            // (ToolRegistry.describeTask), carried on telemetry headers.
+            const subagents = (yield* agents.list())
+              .filter(
+                (item) =>
+                  item.mode !== "primary" &&
+                  Permission.evaluate("task", item.name, agent.permission).action !== "deny",
+              )
+              .map((item) => item.name)
             const result = yield* handle.process({
               user: lastUser,
               agent,
@@ -1282,7 +1450,9 @@ const layer = Layer.effect(
               ],
               tools,
               model,
-              toolChoice: format.type === "json_schema" ? "required" : undefined,
+              toolChoice: format.type === "json_schema" ? "required" : isLastStep ? "none" : undefined,
+              lastStep: isLastStep,
+              subagents,
             })
 
             if (structured !== undefined) {
@@ -1314,6 +1484,15 @@ const layer = Layer.effect(
                 yield* sessions.updateMessage(handle.message)
                 return "break" as const
               }
+            }
+
+            // W6-3: accumulate this step's spend before the loop decides
+            // whether another step is affordable. `total` is used when the
+            // provider reports it, otherwise the components are summed the
+            // same way isOverflow does.
+            {
+              const t = handle.message.tokens
+              turnTokens += t.total || t.input + t.output + t.cache.read + t.cache.write
             }
 
             if (result === "stop") return "break" as const
@@ -1508,6 +1687,10 @@ export const PromptInput = Schema.Struct({
   }),
   format: Schema.optional(SessionV1.Format),
   system: Schema.optional(Schema.String),
+  expected_artifacts: Schema.optional(Schema.Array(Schema.String)).annotate({
+    description:
+      "Files this turn is expected to produce. If the turn would end without them, the agent is told once which are missing and given a chance to finish. Paths are resolved relative to the session directory.",
+  }),
   variant: Schema.optional(Schema.String),
   parts: Schema.Array(
     Schema.Union([

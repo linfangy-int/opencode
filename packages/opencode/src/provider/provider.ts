@@ -31,6 +31,7 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { ModelStatus } from "./model-status"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderError } from "./error"
+import { SessionTier } from "@/session/tier"
 
 const OPENAI_HEADER_TIMEOUT_DEFAULT = 300_000
 
@@ -1039,6 +1040,24 @@ export const Model = Schema.Struct({
   api: ProviderApiInfo,
   name: Schema.String,
   family: optional(Schema.String),
+  tier: optional(Schema.Literals(["minimal", "default"])),
+  // Per-model adjustment of the minimal tier's tool roster. Lets an embedding
+  // product declare which of its own registered tools must survive the cut
+  // instead of the engine guessing; see MINIMAL_TIER_TOOLS in tool/registry.ts.
+  tier_tools: optional(
+    Schema.Struct({
+      include: optional(Schema.mutable(Schema.Array(Schema.String))),
+      exclude: optional(Schema.mutable(Schema.Array(Schema.String))),
+    }),
+  ),
+  prompt: optional(Schema.String),
+  sampling: optional(
+    Schema.Struct({
+      temperature: optional(Schema.Finite),
+      topP: optional(Schema.Finite),
+      topK: optional(Schema.Finite),
+    }),
+  ),
   capabilities: ProviderCapabilities,
   cost: ProviderCost,
   limit: ProviderLimit,
@@ -1210,11 +1229,15 @@ function cost(c: ModelsDev.Model["cost"]): Model["cost"] {
 }
 
 function fromModelsDevModel(provider: ModelsDev.Provider, model: ModelsDev.Model): Model {
+  // The catalog has no declared `model-tier` field yet (upstream issue #41372);
+  // read it defensively from the raw payload so it takes effect when it lands.
+  const catalogTier = (model as unknown as Record<string, unknown>)["model-tier"]
   const base: Model = {
     id: ModelV2.ID.make(model.id),
     providerID: ProviderV2.ID.make(provider.id),
     name: model.name,
     family: model.family,
+    tier: catalogTier === "minimal" || catalogTier === "default" ? catalogTier : undefined,
     api: {
       id: model.id,
       url: model.provider?.api ?? provider.api ?? "",
@@ -1502,6 +1525,10 @@ const layer = Layer.effect(
               },
               headers: mergeDeep(existingModel?.headers ?? {}, model.headers ?? {}),
               family: model.family ?? existingModel?.family ?? "",
+              tier: model.tier ?? existingModel?.tier,
+              tier_tools: model.tier_tools ?? existingModel?.tier_tools,
+              prompt: model.prompt ?? existingModel?.prompt,
+              sampling: model.sampling ?? existingModel?.sampling,
               release_date: model.release_date ?? existingModel?.release_date ?? "",
               variants: {},
             }
@@ -1724,6 +1751,21 @@ const layer = Layer.effect(
             ...model.headers,
           }
 
+        // E7: slow local decode needs a stall guard that tolerates long token
+        // gaps. When the provider config sets no explicit timeout values,
+        // minimal/default-tier models on openai-compatible endpoints default
+        // chunkTimeout to 300s. Scoped to @ai-sdk/openai-compatible so cloud
+        // SDK behavior is untouched; set before the cache key so tiered and
+        // vendor models on the same provider get distinct SDK instances.
+        if (
+          model.api.npm === "@ai-sdk/openai-compatible" &&
+          options["chunkTimeout"] === undefined &&
+          options["timeout"] === undefined &&
+          SessionTier.resolve(model) !== "vendor"
+        ) {
+          options["chunkTimeout"] = 300_000
+        }
+
         const key = Hash.fast(
           JSON.stringify({
             providerID: model.providerID,
@@ -1881,7 +1923,13 @@ const layer = Layer.effect(
       if (cfg.small_model) {
         const parsed = parseModel(cfg.small_model)
         return yield* getModel(parsed.providerID, parsed.modelID).pipe(
-          Effect.catchTag("ProviderModelNotFoundError", () => Effect.succeed(undefined)),
+          // E4: a configured small_model that does not resolve used to fail
+          // silently; name the missing model so the misconfig is visible.
+          Effect.catchTag("ProviderModelNotFoundError", () =>
+            Effect.logWarning("configured small_model not found", { small_model: cfg.small_model }).pipe(
+              Effect.as(undefined),
+            ),
+          ),
         )
       }
 
@@ -1939,6 +1987,17 @@ const layer = Layer.effect(
           continue
         }
         if (candidates[0]) return candidates[0]
+      }
+
+      // E4: config-defined models (local endpoints especially) often carry an
+      // empty family and never match the exact-family ladder. Fall back to a
+      // substring scan over family and id before giving up.
+      for (const needle of ["flash", "nano", "haiku", "mini"]) {
+        const match = models.find(
+          (model) =>
+            (model.family ?? "").toLowerCase().includes(needle) || model.id.toLowerCase().includes(needle),
+        )
+        if (match) return match
       }
 
       return undefined

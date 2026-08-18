@@ -1,6 +1,10 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import type { Auth } from "@/auth"
+import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { DoomLoop } from "../doom-loop"
+import { recordHeadroom, usable } from "../overflow"
+import { Token } from "@/util/token"
 import type { RuntimeFlags } from "@/effect/runtime-flags"
 import { InstanceState } from "@/effect/instance-state"
 import { Permission } from "@/permission"
@@ -9,6 +13,7 @@ import type { MessageV2 } from "../message-v2"
 import type { Provider } from "@/provider/provider"
 import { ProviderTransform } from "@/provider/transform"
 import { SystemPrompt } from "../system"
+import { SessionTier } from "../tier"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { Effect, Record } from "effect"
 import { jsonSchema, tool as aiTool, type ModelMessage, type Tool } from "ai"
@@ -32,7 +37,13 @@ type PrepareInput = {
   readonly auth: Auth.Info | undefined
   readonly plugin: Plugin.Interface
   readonly flags: RuntimeFlags.Info
+  readonly cfg: ConfigV1.Info
   readonly isWorkflow: boolean
+  readonly lastStep?: boolean
+  // D2: non-primary agent names available to the task tool, computed where
+  // agents are in hand (prompt loop) and carried on the telemetry headers so
+  // routers can tighten task.subagent_type without probing the engine.
+  readonly subagents?: readonly string[]
 }
 
 export type Prepared = {
@@ -48,6 +59,10 @@ export type Prepared = {
   }
   readonly messageTransformOptions: Record<string, any>
   readonly headers: Record<string, string>
+  // D3: set when the C6 window-aware clamp reduced the output budget below
+  // what was configured; the caller publishes session.output.clamped from it
+  // (prepare itself has no bus access).
+  readonly outputClamp?: { readonly requested: number; readonly granted: number }
 }
 
 const mergeOptions = (target: Record<string, any>, source: Record<string, any> | undefined): Record<string, any> =>
@@ -75,6 +90,16 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
     const rest = system.slice(1)
     system.length = 0
     system.push(header, rest.join("\n"))
+  }
+
+  // E6: keep the leading system block byte-stable across days so the prompt
+  // cache prefix survives. SystemPrompt.environment drops the volatile date
+  // line on minimal/default tiers; it rides here as a trailing system message
+  // instead. Vendor tiers are byte-identical to upstream, and small utility
+  // calls (title, summary) don't need the date.
+  const tier = SessionTier.resolve(input.model)
+  if (!input.small && (tier === "minimal" || tier === "default")) {
+    system.push(`Today's date: ${new Date().toDateString()}`)
   }
 
   const variant =
@@ -145,7 +170,12 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
     },
   )
 
-  const tools = resolveTools(input)
+  // B1: on the last permitted step the MAX_STEPS_PROMPT tells the model tools
+  // are disabled — make that true on the wire instead of trusting prose. Only
+  // StructuredOutput survives so a json_schema turn can still deliver its
+  // result. With zero tools the AI SDK omits both tools and toolChoice.
+  const resolved = resolveTools(input)
+  const tools = input.lastStep ? Record.filter(resolved, (_, k) => k === "StructuredOutput") : resolved
   // Codex parity: OpenAI Responses-family providers hardcode `strict: false`
   // on every function tool so MCP-sourced and dynamic schemas that don't
   // satisfy OpenAI's structured-outputs constraints still register.
@@ -174,6 +204,35 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
     })
   }
 
+  // Window-aware output clamp: never request more output than the usable
+  // window leaves after the estimated input. This seam is where the fully
+  // composed request (system + messages + resolved tools) first exists, so
+  // the input estimate lives here rather than in the prompt loop. The same
+  // estimates feed the D2 telemetry headers: history is the message payload,
+  // baseline is everything else the request pays (system prompt + tools).
+  const usableWindow = usable({
+    cfg: input.cfg,
+    model: input.model,
+    outputTokenMax: input.flags.outputTokenMax,
+    sessionID: input.sessionID,
+  })
+  const historyTokens = Token.estimate(JSON.stringify(input.messages))
+  const toolsTokens = Token.estimate(
+    JSON.stringify(Object.entries(tools).map(([name, item]) => [name, item.description, item.inputSchema])),
+  )
+  const baselineTokens = Token.estimate(JSON.stringify(system)) + toolsTokens
+  const estimated = historyTokens + baselineTokens
+  // W6-4: publish this request's arithmetic so tools running after it can size
+  // their output against real remaining headroom instead of the whole window.
+  if (input.sessionID) recordHeadroom(input.sessionID, { usable: usableWindow, estimated })
+  const outputClamp = (() => {
+    if (usableWindow <= 0 || params.maxOutputTokens === undefined) return undefined
+    const granted = Math.min(params.maxOutputTokens, Math.max(256, usableWindow - estimated))
+    if (granted >= params.maxOutputTokens) return undefined
+    return { requested: params.maxOutputTokens, granted }
+  })()
+  if (outputClamp) params.maxOutputTokens = outputClamp.granted
+
   const opencodeProjectID = input.model.providerID.startsWith("opencode")
     ? (yield* InstanceState.context).project.id
     : undefined
@@ -184,6 +243,7 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
     tools: Object.fromEntries(Object.entries(tools).toSorted(([a], [b]) => a.localeCompare(b))),
     params,
     messageTransformOptions: options,
+    ...(outputClamp ? { outputClamp } : {}),
     headers: {
       ...(input.model.providerID.startsWith("opencode")
         ? {
@@ -199,18 +259,39 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
             ...(input.parentSessionID ? { "x-parent-session-id": input.parentSessionID } : {}),
             "User-Agent": USER_AGENT,
           }),
+      // D2 telemetry: the engine's own context arithmetic for this request so
+      // proxies/routers gate on a header comparison instead of re-tokenizing
+      // the payload. est-input = history + baseline; baseline includes tools.
+      // Native values come first so the chat.headers plugin hook and per-model
+      // config headers may override, and can never silently lose them.
+      "x-opencode-est-input-tokens": estimated.toString(),
+      "x-opencode-history-tokens": historyTokens.toString(),
+      "x-opencode-baseline-tokens": baselineTokens.toString(),
+      "x-opencode-tools-tokens": toolsTokens.toString(),
+      "x-opencode-limit-context": (input.model.limit.context ?? 0).toString(),
+      "x-opencode-limit-output": ProviderTransform.maxOutputTokens(input.model, input.flags.outputTokenMax).toString(),
+      "x-opencode-usable": usableWindow.toString(),
+      "x-opencode-tier": tier,
+      "x-opencode-session-id": input.sessionID,
+      "x-opencode-agent": input.agent.name,
+      ...(input.subagents?.length ? { "x-opencode-subagents": input.subagents.join(",") } : {}),
       ...input.model.headers,
       ...headers,
     },
   }
 })
 
-function resolveTools(input: Pick<PrepareInput, "tools" | "agent" | "permission" | "user">) {
+function resolveTools(input: Pick<PrepareInput, "tools" | "agent" | "permission" | "user" | "sessionID" | "small">) {
+  // B4: tools stripped by the structural doom-loop stop stay out of the
+  // roster for the session's next requests. Small-model calls (title,
+  // summary) share the session ID but are not agent turns, so they must not
+  // consume the strip budget.
+  const stripped = input.small ? new Set<string>() : DoomLoop.consume(input.sessionID)
   const disabled = Permission.disabled(
     Object.keys(input.tools),
     Permission.merge(input.agent.permission, input.permission ?? []),
   )
-  return Record.filter(input.tools, (_, k) => input.user.tools?.[k] !== false && !disabled.has(k))
+  return Record.filter(input.tools, (_, k) => input.user.tools?.[k] !== false && !disabled.has(k) && !stripped.has(k))
 }
 
 export function hasToolCalls(messages: ModelMessage[]): boolean {

@@ -8,6 +8,7 @@ import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
 import { InstanceRef } from "../../src/effect/instance-ref"
 import { HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import z from "zod"
+import { DoomLoop } from "../../src/session/doom-loop"
 import { LLM } from "../../src/session/llm"
 import { LLMClient, RequestExecutor } from "@opencode-ai/llm/route"
 import { Provider } from "@/provider/provider"
@@ -1135,6 +1136,608 @@ describe("session.llm.stream", () => {
         const capture = yield* Effect.promise(() => request)
         const tools = capture.body.tools as Array<{ function?: { name?: string } }> | undefined
         expect(tools?.some((item) => item.function?.name === "question")).toBe(true)
+      }),
+    {
+      config: () => ({
+        enabled_providers: [alibabaQwenFixture.providerID],
+        provider: {
+          [alibabaQwenFixture.providerID]: {
+            options: { apiKey: "test-key", baseURL: `${state.server!.url.origin}/v1` },
+          },
+        },
+      }),
+    },
+  )
+
+  it.instance(
+    "strips all tools and toolChoice on the last step",
+    () =>
+      Effect.gen(function* () {
+        const fixture = loadFixture(alibabaQwenFixture.providerID, alibabaQwenFixture.modelID)
+        const request = waitRequest(
+          "/chat/completions",
+          new Response(createChatStream("Done"), {
+            status: 200,
+            headers: { "Content-Type": "text/event-stream" },
+          }),
+        )
+
+        const resolved = yield* Provider.use.getModel(
+          ProviderV2.ID.make(alibabaQwenFixture.providerID),
+          ModelV2.ID.make(fixture.model.id),
+        )
+        const sessionID = SessionID.make("session-test-last-step")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+
+        const user = {
+          id: MessageID.make("msg_user-last-step"),
+          sessionID,
+          role: "user",
+          time: { created: Date.now() },
+          agent: agent.name,
+          model: { providerID: ProviderV2.ID.make(alibabaQwenFixture.providerID), modelID: resolved.id },
+        } satisfies SessionV1.User
+
+        yield* drain({
+          user,
+          sessionID,
+          model: resolved,
+          agent,
+          system: ["You are a helpful assistant."],
+          messages: [{ role: "user", content: "Hello" }],
+          tools: {
+            question: tool({
+              description: "Ask a question",
+              inputSchema: z.object({}),
+              execute: async () => ({ output: "" }),
+            }),
+          },
+          toolChoice: "none",
+          lastStep: true,
+        })
+
+        const capture = yield* Effect.promise(() => request)
+        expect(capture.body.tools).toBeUndefined()
+        expect(capture.body.tool_choice).toBeUndefined()
+      }),
+    {
+      config: () => ({
+        enabled_providers: [alibabaQwenFixture.providerID],
+        provider: {
+          [alibabaQwenFixture.providerID]: {
+            options: { apiKey: "test-key", baseURL: `${state.server!.url.origin}/v1` },
+          },
+        },
+      }),
+    },
+  )
+
+  it.instance(
+    "excludes doom-loop stripped tools for the next two requests",
+    () =>
+      Effect.gen(function* () {
+        const fixture = loadFixture(alibabaQwenFixture.providerID, alibabaQwenFixture.modelID)
+        const resolved = yield* Provider.use.getModel(
+          ProviderV2.ID.make(alibabaQwenFixture.providerID),
+          ModelV2.ID.make(fixture.model.id),
+        )
+        const sessionID = SessionID.make("session-test-doom-strip")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+        const user = {
+          id: MessageID.make("msg_user-doom-strip"),
+          sessionID,
+          role: "user",
+          time: { created: Date.now() },
+          agent: agent.name,
+          model: { providerID: ProviderV2.ID.make(alibabaQwenFixture.providerID), modelID: resolved.id },
+        } satisfies SessionV1.User
+        const input = {
+          user,
+          sessionID,
+          model: resolved,
+          agent,
+          system: ["You are a helpful assistant."],
+          messages: [{ role: "user", content: "Hello" }] satisfies ModelMessage[],
+          tools: {
+            question: tool({
+              description: "Ask a question",
+              inputSchema: z.object({}),
+              execute: async () => ({ output: "" }),
+            }),
+          },
+        }
+        const capture = () => {
+          const request = waitRequest(
+            "/chat/completions",
+            new Response(createChatStream("Hello"), {
+              status: 200,
+              headers: { "Content-Type": "text/event-stream" },
+            }),
+          )
+          return drain(input).pipe(Effect.andThen(Effect.promise(() => request)))
+        }
+
+        DoomLoop.strip(sessionID, "question")
+
+        const first = yield* capture()
+        expect(first.body.tools).toBeUndefined()
+        const second = yield* capture()
+        expect(second.body.tools).toBeUndefined()
+        const third = yield* capture()
+        const tools = third.body.tools as Array<{ function?: { name?: string } }> | undefined
+        expect(tools?.some((item) => item.function?.name === "question")).toBe(true)
+      }),
+    {
+      config: () => ({
+        enabled_providers: [alibabaQwenFixture.providerID],
+        provider: {
+          [alibabaQwenFixture.providerID]: {
+            options: { apiKey: "test-key", baseURL: `${state.server!.url.origin}/v1` },
+          },
+        },
+      }),
+    },
+  )
+
+  it.instance(
+    "carries D2 telemetry headers with consistent arithmetic",
+    () =>
+      Effect.gen(function* () {
+        const fixture = loadFixture(alibabaQwenFixture.providerID, alibabaQwenFixture.modelID)
+        const request = waitRequest(
+          "/chat/completions",
+          new Response(createChatStream("Hello"), {
+            status: 200,
+            headers: { "Content-Type": "text/event-stream" },
+          }),
+        )
+
+        const resolved = yield* Provider.use.getModel(
+          ProviderV2.ID.make(alibabaQwenFixture.providerID),
+          ModelV2.ID.make(fixture.model.id),
+        )
+        const sessionID = SessionID.make("session-test-telemetry")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+
+        yield* drain({
+          user: {
+            id: MessageID.make("msg_user-telemetry"),
+            sessionID,
+            role: "user",
+            time: { created: Date.now() },
+            agent: agent.name,
+            model: { providerID: ProviderV2.ID.make(alibabaQwenFixture.providerID), modelID: resolved.id },
+          } satisfies SessionV1.User,
+          sessionID,
+          model: resolved,
+          agent,
+          system: ["You are a helpful assistant."],
+          messages: [{ role: "user", content: "Hello" }],
+          tools: {
+            question: tool({
+              description: "Ask a question",
+              inputSchema: z.object({}),
+              execute: async () => ({ output: "" }),
+            }),
+          },
+          subagents: ["researcher", "reviewer"],
+        })
+
+        const capture = yield* Effect.promise(() => request)
+        const header = (name: string) => capture.headers.get(name)
+        const num = (name: string) => Number(header(name))
+
+        expect(num("x-opencode-est-input-tokens")).toBeGreaterThan(0)
+        expect(num("x-opencode-history-tokens")).toBeGreaterThan(0)
+        expect(num("x-opencode-baseline-tokens")).toBeGreaterThan(0)
+        expect(num("x-opencode-tools-tokens")).toBeGreaterThan(0)
+        // est_input = history + baseline; baseline includes the tools figure.
+        expect(num("x-opencode-est-input-tokens")).toBe(
+          num("x-opencode-history-tokens") + num("x-opencode-baseline-tokens"),
+        )
+        expect(num("x-opencode-baseline-tokens")).toBeGreaterThanOrEqual(num("x-opencode-tools-tokens"))
+        expect(num("x-opencode-limit-context")).toBe(resolved.limit.context)
+        expect(num("x-opencode-limit-output")).toBeGreaterThan(0)
+        expect(num("x-opencode-usable")).toBeGreaterThan(0)
+        expect(header("x-opencode-tier")).toBe("default")
+        expect(header("x-opencode-session-id")).toBe(sessionID)
+        expect(header("x-opencode-agent")).toBe("test")
+        expect(header("x-opencode-subagents")).toBe("researcher,reviewer")
+      }),
+    {
+      config: () => ({
+        enabled_providers: [alibabaQwenFixture.providerID],
+        provider: {
+          [alibabaQwenFixture.providerID]: {
+            options: { apiKey: "test-key", baseURL: `${state.server!.url.origin}/v1` },
+          },
+        },
+      }),
+    },
+  )
+
+  const localModelBase = {
+    name: "Local Model",
+    attachment: false,
+    reasoning: false,
+    temperature: true,
+    tool_call: true,
+    release_date: "2025-01-01",
+    limit: { context: 32_768, output: 8_192 },
+    cost: { input: 0, output: 0 },
+    options: {},
+  }
+  const localConfig = (models: Record<string, Record<string, unknown>>) => ({
+    enabled_providers: ["local"],
+    provider: {
+      local: {
+        name: "Local",
+        env: [],
+        npm: "@ai-sdk/openai-compatible",
+        models,
+        options: { apiKey: "test-key", baseURL: `${state.server!.url.origin}/v1` },
+      },
+    },
+  })
+  const textCallInput = (modelID: string, sessionSuffix: string) =>
+    Effect.gen(function* () {
+      const resolved = yield* Provider.use.getModel(ProviderV2.ID.make("local"), ModelV2.ID.make(modelID))
+      const sessionID = SessionID.make(`session-test-${sessionSuffix}`)
+      const agent = {
+        name: "test",
+        mode: "primary",
+        options: {},
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      } satisfies Agent.Info
+      const captured = { executed: undefined as unknown }
+      return {
+        captured,
+        input: {
+          user: {
+            id: MessageID.make(`msg_user-${sessionSuffix}`),
+            sessionID,
+            role: "user",
+            time: { created: Date.now() },
+            agent: agent.name,
+            model: { providerID: ProviderV2.ID.make("local"), modelID: resolved.id },
+          } satisfies SessionV1.User,
+          sessionID,
+          model: resolved,
+          agent,
+          system: ["You are a helpful assistant."],
+          messages: [{ role: "user", content: "Look up the weather" }] satisfies ModelMessage[],
+          tools: {
+            lookup: tool({
+              description: "Lookup data",
+              inputSchema: z.object({ query: z.string() }),
+              execute: async (args) => {
+                captured.executed = args
+                return { output: "looked up" }
+              },
+            }),
+          },
+        } satisfies LLM.StreamInput,
+      }
+    })
+
+  it.instance(
+    "lifts a text-format tool call into a native call on the minimal tier",
+    () =>
+      Effect.gen(function* () {
+        const request = waitRequest(
+          "/chat/completions",
+          new Response(createChatStream('<tool_call>{"name": "lookup", "arguments": {"query": "weather"}}</tool_call>'), {
+            status: 200,
+            headers: { "Content-Type": "text/event-stream" },
+          }),
+        )
+        const { captured, input } = yield* textCallInput("qwen3-4b", "textcall-minimal")
+        yield* drain(input)
+        yield* Effect.promise(() => request)
+        expect(captured.executed).toEqual({ query: "weather" })
+      }),
+    { config: () => localConfig({ "qwen3-4b": { ...localModelBase, id: "qwen3-4b" } }) },
+  )
+
+  it.instance(
+    "lifts a fenced json tool call when capabilities.toolcall is false",
+    () =>
+      Effect.gen(function* () {
+        const request = waitRequest(
+          "/chat/completions",
+          new Response(createChatStream('```json\n{"tool": "lookup", "parameters": {"query": "weather"}}\n```'), {
+            status: 200,
+            headers: { "Content-Type": "text/event-stream" },
+          }),
+        )
+        // No parameter suffix: the id resolves the default tier, so only the
+        // toolcall === false capability gates the middleware in.
+        const { captured, input } = yield* textCallInput("local-large", "textcall-notoolcall")
+        yield* drain(input)
+        yield* Effect.promise(() => request)
+        expect(captured.executed).toEqual({ query: "weather" })
+      }),
+    { config: () => localConfig({ "local-large": { ...localModelBase, id: "local-large", tool_call: false } }) },
+  )
+
+  it.instance(
+    "bypasses text tool-call lifting for toolcall-capable non-minimal models",
+    () =>
+      Effect.gen(function* () {
+        const request = waitRequest(
+          "/chat/completions",
+          new Response(createChatStream('<tool_call>{"name": "lookup", "arguments": {"query": "weather"}}</tool_call>'), {
+            status: 200,
+            headers: { "Content-Type": "text/event-stream" },
+          }),
+        )
+        const { captured, input } = yield* textCallInput("local-large", "textcall-bypass")
+        yield* drain(input)
+        yield* Effect.promise(() => request)
+        expect(captured.executed).toBeUndefined()
+      }),
+    { config: () => localConfig({ "local-large": { ...localModelBase, id: "local-large" } }) },
+  )
+
+  it.instance(
+    "keeps the leading system message date-free and stable on the default tier",
+    () =>
+      Effect.gen(function* () {
+        const fixture = loadFixture(alibabaQwenFixture.providerID, alibabaQwenFixture.modelID)
+        const resolved = yield* Provider.use.getModel(
+          ProviderV2.ID.make(alibabaQwenFixture.providerID),
+          ModelV2.ID.make(fixture.model.id),
+        )
+        const sessionID = SessionID.make("session-test-cache-prefix")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+        const input = {
+          user: {
+            id: MessageID.make("msg_user-cache-prefix"),
+            sessionID,
+            role: "user",
+            time: { created: Date.now() },
+            agent: agent.name,
+            model: { providerID: ProviderV2.ID.make(alibabaQwenFixture.providerID), modelID: resolved.id },
+          } satisfies SessionV1.User,
+          sessionID,
+          model: resolved,
+          agent,
+          system: ["You are a helpful assistant."],
+          messages: [{ role: "user", content: "Hello" }] satisfies ModelMessage[],
+          tools: {},
+        }
+        const capture = () => {
+          const request = waitRequest(
+            "/chat/completions",
+            new Response(createChatStream("Hello"), {
+              status: 200,
+              headers: { "Content-Type": "text/event-stream" },
+            }),
+          )
+          return drain(input).pipe(Effect.andThen(Effect.promise(() => request)))
+        }
+
+        const first = yield* capture()
+        const second = yield* capture()
+        const systems = (body: Record<string, unknown>) =>
+          (body.messages as Array<{ role: string; content: string }>).filter((msg) => msg.role === "system")
+
+        // E6: the volatile date rides in a trailing system message; the
+        // leading system message is date-free and identical across turns.
+        const firstSystems = systems(first.body)
+        const secondSystems = systems(second.body)
+        expect(firstSystems[0]?.content).not.toContain("Today's date")
+        expect(firstSystems[0]?.content).toBe(secondSystems[0]?.content ?? "")
+        expect(firstSystems[firstSystems.length - 1]?.content).toBe(`Today's date: ${new Date().toDateString()}`)
+      }),
+    {
+      config: () => ({
+        enabled_providers: [alibabaQwenFixture.providerID],
+        provider: {
+          [alibabaQwenFixture.providerID]: {
+            options: { apiKey: "test-key", baseURL: `${state.server!.url.origin}/v1` },
+          },
+        },
+      }),
+    },
+  )
+
+  it.instance(
+    "repairs malformed tool-call JSON arguments in-stream",
+    () =>
+      Effect.gen(function* () {
+        const fixture = loadFixture(alibabaQwenFixture.providerID, alibabaQwenFixture.modelID)
+        const request = waitRequest(
+          "/chat/completions",
+          createEventResponse(
+            [
+              {
+                id: "chatcmpl-repair",
+                object: "chat.completion.chunk",
+                choices: [
+                  {
+                    index: 0,
+                    delta: {
+                      role: "assistant",
+                      tool_calls: [
+                        {
+                          index: 0,
+                          id: "call-repair",
+                          type: "function",
+                          // Single quotes plus a trailing comma: invalid JSON
+                          // that the mechanical repair can fix.
+                          function: { name: "lookup", arguments: "{'query': 'weather',}" },
+                        },
+                      ],
+                    },
+                  },
+                ],
+              },
+              {
+                id: "chatcmpl-repair",
+                object: "chat.completion.chunk",
+                choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+              },
+            ],
+            true,
+          ),
+        )
+
+        const resolved = yield* Provider.use.getModel(
+          ProviderV2.ID.make(alibabaQwenFixture.providerID),
+          ModelV2.ID.make(fixture.model.id),
+        )
+        const sessionID = SessionID.make("session-test-arg-repair")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+        let executed: unknown
+
+        yield* drain({
+          user: {
+            id: MessageID.make("msg_user-arg-repair"),
+            sessionID,
+            role: "user",
+            time: { created: Date.now() },
+            agent: agent.name,
+            model: { providerID: ProviderV2.ID.make(alibabaQwenFixture.providerID), modelID: resolved.id },
+          } satisfies SessionV1.User,
+          sessionID,
+          model: resolved,
+          agent,
+          system: ["You are a helpful assistant."],
+          messages: [{ role: "user", content: "Use lookup" }],
+          tools: {
+            lookup: tool({
+              description: "Lookup data",
+              inputSchema: z.object({ query: z.string() }),
+              execute: async (args) => {
+                executed = args
+                return { output: "looked up" }
+              },
+            }),
+          },
+        })
+
+        yield* Effect.promise(() => request)
+        expect(executed).toEqual({ query: "weather" })
+      }),
+    {
+      config: () => ({
+        enabled_providers: [alibabaQwenFixture.providerID],
+        provider: {
+          [alibabaQwenFixture.providerID]: {
+            options: { apiKey: "test-key", baseURL: `${state.server!.url.origin}/v1` },
+          },
+        },
+      }),
+    },
+  )
+
+  it.instance(
+    "executes tool calls with snake_case argument keys",
+    () =>
+      Effect.gen(function* () {
+        const fixture = loadFixture(alibabaQwenFixture.providerID, alibabaQwenFixture.modelID)
+        const request = waitRequest(
+          "/chat/completions",
+          createEventResponse(
+            [
+              {
+                id: "chatcmpl-snake",
+                object: "chat.completion.chunk",
+                choices: [
+                  {
+                    index: 0,
+                    delta: {
+                      role: "assistant",
+                      tool_calls: [
+                        {
+                          index: 0,
+                          id: "call-snake",
+                          type: "function",
+                          // Valid JSON but snake_case keys against a camelCase schema.
+                          function: { name: "read", arguments: '{"file_path": "a.txt"}' },
+                        },
+                      ],
+                    },
+                  },
+                ],
+              },
+              {
+                id: "chatcmpl-snake",
+                object: "chat.completion.chunk",
+                choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+              },
+            ],
+            true,
+          ),
+        )
+
+        const resolved = yield* Provider.use.getModel(
+          ProviderV2.ID.make(alibabaQwenFixture.providerID),
+          ModelV2.ID.make(fixture.model.id),
+        )
+        const sessionID = SessionID.make("session-test-snake-args")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+        let executed: unknown
+
+        yield* drain({
+          user: {
+            id: MessageID.make("msg_user-snake-args"),
+            sessionID,
+            role: "user",
+            time: { created: Date.now() },
+            agent: agent.name,
+            model: { providerID: ProviderV2.ID.make(alibabaQwenFixture.providerID), modelID: resolved.id },
+          } satisfies SessionV1.User,
+          sessionID,
+          model: resolved,
+          agent,
+          system: ["You are a helpful assistant."],
+          messages: [{ role: "user", content: "Read a.txt" }],
+          tools: {
+            read: tool({
+              description: "Read a file",
+              inputSchema: z.object({ filePath: z.string() }),
+              execute: async (args) => {
+                executed = args
+                return { output: "contents" }
+              },
+            }),
+          },
+        })
+
+        yield* Effect.promise(() => request)
+        expect(executed).toEqual({ filePath: "a.txt" })
       }),
     {
       config: () => ({

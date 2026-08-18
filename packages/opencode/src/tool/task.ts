@@ -14,6 +14,7 @@ import { Effect, Exit, Schema, Scope } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Database } from "@opencode-ai/core/database/database"
+import { TurnBudget } from "@/session/turn-budget"
 
 export interface TaskPromptOps {
   cancel(sessionID: SessionID): Effect.Effect<void>
@@ -63,7 +64,7 @@ export const Parameters = Schema.Struct({
 
 function renderOutput(input: {
   sessionID: SessionID
-  state: "running" | "completed" | "error"
+  state: "running" | "completed" | "error" | "max_steps"
   summary?: string
   text: string
 }) {
@@ -76,6 +77,47 @@ function renderOutput(input: {
     `</${tag}>`,
     "</task>",
   ].join("\n")
+}
+
+// W6-5: the structural stop (B1) ends a turn by sending the max-steps directive
+// with no tools. Models routinely answer that directive by restating it, so a
+// subagent's final text is often the directive itself. Forwarding it to the
+// parent is actively misleading: it reads as an instruction addressed to the
+// parent ("tools are disabled until next user input"), and the parent surfaces
+// the whole delegation as an unexplained failure even when real work was done.
+// Strip it and report what actually happened instead.
+const STOP_DIRECTIVE_MARKERS = ["MAXIMUM STEPS REACHED", "maximum number of steps allowed"]
+
+function stripStopDirective(text: string) {
+  return text
+    .split(/\n{2,}/)
+    .filter((block) => !STOP_DIRECTIVE_MARKERS.some((marker) => block.includes(marker)))
+    .join("\n\n")
+    .trim()
+}
+
+function budgetSummary(info: TurnBudget.Exhausted) {
+  if (info.reason === "turn_tokens") return `token budget after ${info.steps} steps (${info.tokens} tokens)`
+  if (info.reason === "turn_seconds") return `time budget after ${info.steps} steps (${info.seconds}s)`
+  return `step limit (${info.steps} steps)`
+}
+
+// Recovery text is addressed to the parent and names a decision it can act on,
+// rather than repeating a constraint that has already been enforced structurally.
+function renderExhausted(input: { sessionID: SessionID; info: TurnBudget.Exhausted; text: string }) {
+  const partial = stripStopDirective(input.text)
+  return renderOutput({
+    sessionID: input.sessionID,
+    state: "max_steps",
+    summary: `Subagent stopped early: reached its ${budgetSummary(input.info)}. Work below may be incomplete.`,
+    text: [
+      partial.length > 0 ? partial : "The subagent produced no final summary before its budget ran out.",
+      "",
+      "This is a budget stop, not a task failure - treat the above as partial progress.",
+      "Do not retry the same delegation unchanged: either finish the remaining work directly,",
+      "or delegate a smaller, more specific piece of it.",
+    ].join("\n"),
+  })
 }
 
 export const TaskTool = Tool.define(
@@ -133,8 +175,14 @@ export const TaskTool = Tool.define(
         return yield* Effect.fail(new Error(`Unknown agent type: ${params.subagent_type} is not a valid agent type`))
       }
 
-      const session = params.task_id
-        ? yield* sessions.get(SessionID.make(params.task_id)).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+      // E2: small models echo a label into task_id on a fresh dispatch;
+      // SessionID.make would die on it and burn the step (#1367). A value
+      // without the "ses" session-id prefix is a label, not a resume — ignore
+      // it and dispatch fresh. camelCase variants (taskId/taskID) are already
+      // dropped by the parameter schema decode.
+      const taskID = params.task_id?.startsWith("ses") ? params.task_id : undefined
+      const session = taskID
+        ? yield* sessions.get(SessionID.make(taskID)).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
         : undefined
       const childPermission = deriveSubagentSessionPermission({
         parentSessionPermission: parent.permission ?? [],
@@ -210,7 +258,9 @@ export const TaskTool = Tool.define(
           agent: next.name,
           parts,
         })
-        return result.parts.findLast((item) => item.type === "text")?.text ?? ""
+        const text = result.parts.findLast((item) => item.type === "text")?.text ?? ""
+        const info = TurnBudget.consume(nextSession.id)
+        return info ? renderExhausted({ sessionID: nextSession.id, info, text }) : text
       })
 
       const inject = Effect.fn("TaskTool.injectBackgroundResult")(function* (

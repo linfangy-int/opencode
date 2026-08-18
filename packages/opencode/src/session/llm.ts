@@ -6,7 +6,7 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { Context, Effect, Layer } from "effect"
 import * as Stream from "effect/Stream"
-import { streamText, wrapLanguageModel, type ModelMessage, type Tool } from "ai"
+import { asSchema, streamText, wrapLanguageModel, type ModelMessage, type Tool } from "ai"
 import type { LLMEvent } from "@opencode-ai/llm"
 import { LLMClient } from "@opencode-ai/llm/route"
 import type { LLMClientService } from "@opencode-ai/llm/route"
@@ -19,6 +19,7 @@ import { Plugin } from "@/plugin"
 import { Permission } from "@/permission"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { EventV2 } from "@opencode-ai/core/event"
+import { SessionBudgetEvent } from "@opencode-ai/schema/session-budget-event"
 import { Wildcard } from "@/util/wildcard"
 import { SessionID } from "@/session/schema"
 import { Auth } from "@/auth"
@@ -28,7 +29,10 @@ import * as Option from "effect/Option"
 import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { LLMAISDK } from "./llm/ai-sdk"
 import { LLMNativeRuntime } from "./llm/native-runtime"
+import { LLMRepair } from "./llm/repair"
 import { LLMRequestPrep } from "./llm/request"
+import { LLMTextCall } from "./llm/textcall"
+import { SessionTier } from "./tier"
 
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
 
@@ -45,6 +49,12 @@ export type StreamInput = {
   tools: Record<string, Tool>
   retries?: number
   toolChoice?: "auto" | "required" | "none"
+  // B1: the prompt loop's final permitted step. Request prep strips the tool
+  // roster so the MAX_STEPS_PROMPT's "tools are disabled" claim is true on the wire.
+  lastStep?: boolean
+  // D2: non-primary agent names available to the task tool, forwarded to the
+  // telemetry headers. Computed in the prompt loop where agents are in hand.
+  subagents?: readonly string[]
 }
 
 export type StreamRequest = StreamInput & {
@@ -109,8 +119,18 @@ const live: Layer.Layer<
         auth: info,
         plugin,
         flags,
+        cfg,
         isWorkflow,
       })
+
+      // D3: surface the C6 output clamp on the bus.
+      if (prepared.outputClamp) {
+        yield* events.publish(SessionBudgetEvent.OutputClamped, {
+          sessionID: SessionID.make(input.sessionID),
+          requested: prepared.outputClamp.requested,
+          granted: prepared.outputClamp.granted,
+        })
+      }
 
       // Wire up toolExecutor for DWS workflow models so that tool calls
       // from the workflow service are executed via opencode's tool system
@@ -295,10 +315,49 @@ const live: Layer.Layer<
           includeRawChunks: input.model.providerID.includes("github-copilot"),
           async experimental_repairToolCall(failed) {
             const lower = failed.toolCall.toolName.toLowerCase()
-            if (lower !== failed.toolCall.toolName && prepared.tools[lower]) {
-              return {
-                ...failed.toolCall,
-                toolName: lower,
+            const name = prepared.tools[failed.toolCall.toolName]
+              ? failed.toolCall.toolName
+              : prepared.tools[lower]
+                ? lower
+                : undefined
+            // B5: attempt mechanical JSON repair (smart quotes, single quotes,
+            // python literals, trailing commas, unbalanced brackets) before
+            // burning a provider round-trip on the invalid tool. Only a
+            // repaired input that also validates against the tool schema is
+            // returned — an invalid repaired call would otherwise degrade into
+            // the AI SDK's dynamic invalid path instead of ours below.
+            if (name) {
+              const schema = asSchema(prepared.tools[name].inputSchema)
+              const validates = async (input: string) => {
+                if (!schema.validate) return true
+                const result = await schema.validate(JSON.parse(input))
+                return result.success
+              }
+              const repaired = LLMRepair.repair(failed.toolCall.input)
+              if (repaired !== undefined && (await validates(repaired))) {
+                return {
+                  ...failed.toolCall,
+                  toolName: name,
+                  input: repaired,
+                }
+              }
+              // E1: snake_case argument keys (file_path → filePath) are a
+              // schema reject today and burn a full retry round-trip. Retry
+              // with top-level keys camelCased; accept only when the
+              // transformed arguments validate against the tool schema.
+              const camel = LLMRepair.camelKeys(repaired ?? failed.toolCall.input)
+              if (camel !== undefined && (await validates(camel))) {
+                return {
+                  ...failed.toolCall,
+                  toolName: name,
+                  input: camel,
+                }
+              }
+              if (name !== failed.toolCall.toolName) {
+                return {
+                  ...failed.toolCall,
+                  toolName: name,
+                }
               }
             }
             return {
@@ -339,6 +398,17 @@ const live: Layer.Layer<
                   return args.params
                 },
               },
+              // B6: models that cannot emit native tool calls, and minimal-tier
+              // models that habitually write calls as text, get stream-level
+              // text-format tool-call lifting. Everything else bypasses.
+              ...(() => {
+                const names = new Set(Object.keys(prepared.tools).filter((name) => name !== "invalid"))
+                const gated =
+                  (input.model.capabilities.toolcall === false ||
+                    SessionTier.resolve(input.model) === "minimal") &&
+                  names.size > 0
+                return gated ? [LLMTextCall.middleware(names)] : []
+              })(),
             ],
           }),
           experimental_telemetry: {

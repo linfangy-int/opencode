@@ -12,10 +12,14 @@ import { Snapshot } from "@/snapshot"
 import { Session } from "./session"
 import { LLM } from "./llm"
 import { MessageV2 } from "./message-v2"
-import { isOverflow } from "./overflow"
+import { DoomLoop } from "./doom-loop"
+import { isOverflow, learnContextLimit, overflowReport } from "./overflow"
+import { SessionBudgetEvent } from "@opencode-ai/schema/session-budget-event"
+import { Token } from "@/util/token"
 import { PartID } from "./schema"
 import type { SessionID } from "./schema"
 import { SessionRetry } from "./retry"
+import { SessionTier } from "./tier"
 import { SessionStatus } from "./status"
 import { SessionSummary } from "./summary"
 import type { Provider } from "@/provider/provider"
@@ -28,6 +32,10 @@ import { Usage, type LLMEvent } from "@opencode-ai/llm"
 
 const DOOM_LOOP_THRESHOLD = 3
 export type Result = "compact" | "stop" | "continue"
+
+// D5: tools whose completed parts count as written artifacts when
+// reconciling a turn's reported status against what it actually produced.
+export const FILE_WRITING_TOOLS = new Set(["write", "edit", "apply_patch"])
 
 export interface Handle {
   readonly message: SessionV1.Assistant
@@ -72,6 +80,7 @@ interface ProcessorContext extends Input {
   needsCompaction: boolean
   currentText: SessionV1.TextPart | undefined
   reasoningMap: Record<string, SessionV1.ReasoningPart>
+  lastStream: LLM.StreamInput | undefined
 }
 
 type StreamEvent = LLMEvent
@@ -111,6 +120,7 @@ const layer = Layer.effect(
         needsCompaction: false,
         currentText: undefined,
         reasoningMap: {},
+        lastStream: undefined,
       }
       let aborted = false
 
@@ -369,6 +379,25 @@ const layer = Layer.effect(
             }
 
             const agent = yield* agents.get(ctx.assistantMessage.agent)
+            // B4: on the minimal tier a doom_loop "ask" becomes a structural
+            // stop — the tool is stripped from the session's next requests
+            // (see resolveTools in llm/request.ts) and the model gets exact
+            // recovery text instead of a human being asked.
+            const rule = Permission.evaluate("doom_loop", value.name, agent.permission)
+            if (DoomLoop.shouldStrip(rule.action, ctx.model)) {
+              DoomLoop.strip(ctx.sessionID, value.name)
+              // D3: augment the B4 log with a typed bus event.
+              yield* events.publish(SessionBudgetEvent.ToolStripped, {
+                sessionID: ctx.sessionID,
+                tool: value.name,
+              })
+              yield* Effect.logWarning("doom loop tool stripped", {
+                "session.id": ctx.sessionID,
+                tool: value.name,
+              })
+              yield* failToolCall(value.id, new Error(DoomLoop.recovery(value.name)))
+              return
+            }
             yield* permission.ask({
               permission: "doom_loop",
               patterns: [value.name],
@@ -474,11 +503,22 @@ const layer = Layer.effect(
                 messageID: ctx.assistantMessage.parentID,
               })
               .pipe(Effect.ignore, Effect.forkIn(scope))
-            if (
-              !ctx.assistantMessage.summary &&
-              isOverflow({ cfg: yield* config.get(), tokens: usage.tokens, model: ctx.model })
-            ) {
-              ctx.needsCompaction = true
+            {
+              const check = {
+                cfg: yield* config.get(),
+                tokens: usage.tokens,
+                model: ctx.model,
+                sessionID: ctx.sessionID,
+              }
+              if (!ctx.assistantMessage.summary && isOverflow(check)) {
+                ctx.needsCompaction = true
+                // D3: the step-finish overflow gate decision, visible on the bus.
+                yield* events.publish(SessionBudgetEvent.OverflowDetected, {
+                  sessionID: ctx.sessionID,
+                  ...overflowReport(check),
+                  action: "compact",
+                })
+              }
             }
             return
           }
@@ -522,6 +562,12 @@ const layer = Layer.effect(
               },
               { text: ctx.currentText.text },
             )).text
+            // E5: reasoning-in-text models leak <think> blocks into normal
+            // turns; on the minimal tier scrub them from the completed part
+            // (streaming deltas flow raw, the stored part is the record).
+            // Same regex the title generation uses.
+            if (SessionTier.resolve(ctx.model) === "minimal")
+              ctx.currentText.text = ctx.currentText.text.replace(/<think>[\s\S]*?<\/think>\s*/g, "")
             {
               const end = Date.now()
               ctx.currentText.time = { start: ctx.currentText.time?.start ?? end, end }
@@ -596,6 +642,21 @@ const layer = Layer.effect(
         yield* session.updateMessage(ctx.assistantMessage)
       })
 
+      // D5: completed file-writing tool parts across the current turn (all
+      // assistant messages sharing this message's parent user message), so a
+      // terminal error event can carry evidence that the turn produced
+      // artifacts before failing.
+      const partsWritten = Effect.fn("SessionProcessor.partsWritten")(function* () {
+        const msgs = yield* session
+          .messages({ sessionID: ctx.sessionID })
+          .pipe(Effect.catch(() => Effect.succeed<SessionV1.WithParts[]>([])))
+        return msgs
+          .filter((m) => m.info.role === "assistant" && m.info.parentID === ctx.assistantMessage.parentID)
+          .flatMap((m) => m.parts)
+          .filter((part) => part.type === "tool" && FILE_WRITING_TOOLS.has(part.tool) && part.state.status === "completed")
+          .length
+      })
+
       const halt = Effect.fn("SessionProcessor.halt")(function* (e: unknown) {
         yield* Effect.logError("process", {
           "session.id": input.sessionID,
@@ -605,10 +666,26 @@ const layer = Layer.effect(
         })
         const error = parse(e)
         if (SessionV1.ContextOverflowError.isInstance(error)) {
+          // With no configured context limit, remember the failing request's
+          // estimated size as a session-level upper bound so the next
+          // overflow check compacts before the provider rejects again.
+          if (!input.model.limit.context && ctx.lastStream) {
+            const estimated = Token.estimate(JSON.stringify([ctx.lastStream.system, ctx.lastStream.messages]))
+            learnContextLimit(ctx.sessionID, estimated)
+            yield* Effect.logWarning("learned session context cap from provider overflow", {
+              "session.id": ctx.sessionID,
+              estimated,
+            })
+          }
           if ((yield* config.get()).compaction?.auto === false && !ctx.assistantMessage.summary) {
             ctx.assistantMessage.error = error
             ctx.assistantMessage.finish = "error"
-            yield* events.publish(Session.Event.Error, { sessionID: ctx.sessionID, error })
+            const written = yield* partsWritten()
+            yield* events.publish(Session.Event.Error, {
+              sessionID: ctx.sessionID,
+              error,
+              ...(written > 0 ? { parts_written: written } : {}),
+            })
             yield* status.set(ctx.sessionID, { type: "idle" })
             return
           }
@@ -617,9 +694,13 @@ const layer = Layer.effect(
           return
         }
         ctx.assistantMessage.error = error
+        // D5: a turn erroring after successful file writes must say so — the
+        // error alone reads as "produced nothing" and poisons reconciliation.
+        const written = yield* partsWritten()
         yield* events.publish(Session.Event.Error, {
           sessionID: ctx.assistantMessage.sessionID,
           error: ctx.assistantMessage.error,
+          ...(written > 0 ? { parts_written: written } : {}),
         })
         yield* status.set(ctx.sessionID, { type: "idle" })
       })
@@ -630,6 +711,7 @@ const layer = Layer.effect(
           messageID: input.assistantMessage.id,
         })
         ctx.needsCompaction = false
+        ctx.lastStream = streamInput
         ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
 
         return yield* Effect.gen(function* () {

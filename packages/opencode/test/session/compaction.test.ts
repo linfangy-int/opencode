@@ -533,14 +533,34 @@ describe("session.compaction.isOverflow", () => {
   )
 
   it.live(
-    "returns false when model context limit is 0",
+    "applies the conservative default window when model context limit is 0",
     provideTmpdirInstance(() =>
       Effect.gen(function* () {
         const compact = yield* SessionCompaction.Service
         const model = createModel({ context: 0, output: 32_000 })
         const tokens = { input: 100_000, output: 10_000, reasoning: 0, cache: { read: 0, write: 0 } }
-        expect(yield* compact.isOverflow({ tokens, model })).toBe(false)
+        expect(yield* compact.isOverflow({ tokens, model })).toBe(true)
+        const small = { input: 10_000, output: 1_000, reasoning: 0, cache: { read: 0, write: 0 } }
+        expect(yield* compact.isOverflow({ tokens: small, model })).toBe(false)
       }),
+    ),
+  )
+
+  it.live(
+    "keeps unset context limit as no overflow when compaction.auto is disabled",
+    provideTmpdirInstance(
+      () =>
+        Effect.gen(function* () {
+          const compact = yield* SessionCompaction.Service
+          const model = createModel({ context: 0, output: 32_000 })
+          const tokens = { input: 100_000, output: 10_000, reasoning: 0, cache: { read: 0, write: 0 } }
+          expect(yield* compact.isOverflow({ tokens, model })).toBe(false)
+        }),
+      {
+        config: {
+          compaction: { auto: false },
+        },
+      },
     ),
   )
 
@@ -1173,7 +1193,7 @@ describe("session.compaction.process", () => {
   )
 
   it.instance(
-    "falls back to overflow guidance when no replayable turn exists",
+    "falls back to truthful overflow guidance when no media was removed",
     Effect.gen(function* () {
       const ssn = yield* SessionNs.Service
       const session = yield* ssn.create({})
@@ -1193,8 +1213,49 @@ describe("session.compaction.process", () => {
 
       expect(result).toBe("continue")
       expect(last?.info.role).toBe("user")
+      expect(last?.parts[0]?.type).toBe("text")
       if (last?.parts[0]?.type === "text") {
-        expect(last.parts[0].text).toContain("previous request exceeded the provider's size limit")
+        expect(last.parts[0].text).toContain("exceeded the model's context window and was compacted")
+        expect(last.parts[0].text).toContain("Do not mention attachments to the user; there were none.")
+        expect(last.parts[0].text).not.toContain("media attachments")
+      }
+    }),
+  )
+
+  it.instance(
+    "mentions media attachments in overflow guidance only when media was removed",
+    Effect.gen(function* () {
+      const ssn = yield* SessionNs.Service
+      const session = yield* ssn.create({})
+      const earlier = yield* createUserMessage(session.id, "earlier")
+      yield* ssn.updatePart({
+        id: PartID.ascending(),
+        messageID: earlier.id,
+        sessionID: session.id,
+        type: "file",
+        mime: "image/png",
+        filename: "big.png",
+        url: `data:image/png;base64,${"a".repeat(1_000)}`,
+      })
+      const msg = yield* createUserMessage(session.id, "current")
+      const msgs = yield* ssn.messages({ sessionID: session.id })
+
+      const result = yield* SessionCompaction.use.process({
+        parentID: msg.id,
+        messages: msgs,
+        sessionID: session.id,
+        auto: true,
+        overflow: true,
+      })
+
+      const last = (yield* ssn.messages({ sessionID: session.id })).at(-1)
+
+      expect(result).toBe("continue")
+      expect(last?.info.role).toBe("user")
+      expect(last?.parts[0]?.type).toBe("text")
+      if (last?.parts[0]?.type === "text") {
+        expect(last.parts[0].text).toContain("large media attachments")
+        expect(last.parts[0].text).not.toContain("there were none")
       }
     }),
   )
@@ -1416,6 +1477,37 @@ describe("session.compaction.process", () => {
         withCompaction({
           llm: stub.llmLayer,
           config: cfg({ tail_turns: 2, preserve_recent_tokens: 10_000 }),
+        }),
+      )
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "compaction.prompt config replaces the built-in summary template",
+    () => {
+      const stub = llm()
+      let captured = ""
+      stub.push(reply("summary", (input) => (captured = JSON.stringify(input.messages))))
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        yield* createUserMessage(session.id, "older context")
+        yield* createCompactionMarker(session.id)
+
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+        const parent = msgs.at(-1)?.info.id
+        expect(parent).toBeTruthy()
+        yield* SessionCompaction.use.process({ parentID: parent!, messages: msgs, sessionID: session.id, auto: false })
+
+        expect(captured).toContain("CUSTOM COMPACTION TEMPLATE")
+        expect(captured).toContain("The following is the conversation history:")
+        expect(captured).toContain("[User]: older context")
+        expect(captured).not.toContain("Create a new anchored summary")
+      }).pipe(
+        withCompaction({
+          llm: stub.llmLayer,
+          config: cfg({ prompt: "CUSTOM COMPACTION TEMPLATE" }),
         }),
       )
     },

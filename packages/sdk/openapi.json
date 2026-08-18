@@ -5925,6 +5925,86 @@
         ]
       }
     },
+    "/session/{sessionID}/context-budget": {
+      "get": {
+        "tags": ["session"],
+        "operationId": "session.contextBudget",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^ses"
+            },
+            "required": true
+          },
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Context budget",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionContextBudget"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "BadRequest | InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Report the session's context arithmetic: effective model limits, compaction reserve, usable window, per-request baseline cost (system prompt, tools, instructions), history estimate with provider-reported usage, and projected headroom for the next request.",
+        "summary": "Get session context budget",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.session.contextBudget({\n  ...\n})"
+          }
+        ]
+      }
+    },
     "/session/{sessionID}/todo": {
       "get": {
         "tags": ["session"],
@@ -15497,7 +15577,25 @@
             "$ref": "#/components/schemas/EventQuestionRejected"
           },
           {
+            "$ref": "#/components/schemas/EventSessionOverflowDetected"
+          },
+          {
+            "$ref": "#/components/schemas/EventSessionOutputClamped"
+          },
+          {
+            "$ref": "#/components/schemas/EventSessionToolStripped"
+          },
+          {
             "$ref": "#/components/schemas/EventSessionCompacted"
+          },
+          {
+            "$ref": "#/components/schemas/EventSessionCompactionStarted"
+          },
+          {
+            "$ref": "#/components/schemas/EventSessionCompactionCompleted"
+          },
+          {
+            "$ref": "#/components/schemas/EventSessionTurnCompleted"
           },
           {
             "$ref": "#/components/schemas/EventVcsBranchUpdated"
@@ -19134,6 +19232,9 @@
                             "$ref": "#/components/schemas/APIError"
                           }
                         ]
+                      },
+                      "parts_written": {
+                        "type": "number"
                       }
                     },
                     "additionalProperties": false
@@ -20203,6 +20304,106 @@
                   },
                   "type": {
                     "type": "string",
+                    "enum": ["session.overflow.detected"]
+                  },
+                  "properties": {
+                    "type": "object",
+                    "properties": {
+                      "sessionID": {
+                        "type": "string",
+                        "pattern": "^ses"
+                      },
+                      "tokens": {
+                        "type": "number"
+                      },
+                      "usable": {
+                        "type": "number"
+                      },
+                      "reserve": {
+                        "type": "number"
+                      },
+                      "action": {
+                        "type": "string",
+                        "enum": ["compact"]
+                      }
+                    },
+                    "required": ["sessionID", "tokens", "usable", "reserve", "action"],
+                    "additionalProperties": false
+                  }
+                },
+                "required": ["id", "type", "properties"],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "pattern": "^evt_"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": ["session.output.clamped"]
+                  },
+                  "properties": {
+                    "type": "object",
+                    "properties": {
+                      "sessionID": {
+                        "type": "string",
+                        "pattern": "^ses"
+                      },
+                      "requested": {
+                        "type": "number"
+                      },
+                      "granted": {
+                        "type": "number"
+                      }
+                    },
+                    "required": ["sessionID", "requested", "granted"],
+                    "additionalProperties": false
+                  }
+                },
+                "required": ["id", "type", "properties"],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "pattern": "^evt_"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": ["session.tool.stripped"]
+                  },
+                  "properties": {
+                    "type": "object",
+                    "properties": {
+                      "sessionID": {
+                        "type": "string",
+                        "pattern": "^ses"
+                      },
+                      "tool": {
+                        "type": "string"
+                      }
+                    },
+                    "required": ["sessionID", "tool"],
+                    "additionalProperties": false
+                  }
+                },
+                "required": ["id", "type", "properties"],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "pattern": "^evt_"
+                  },
+                  "type": {
+                    "type": "string",
                     "enum": ["session.compacted"]
                   },
                   "properties": {
@@ -20214,6 +20415,103 @@
                       }
                     },
                     "required": ["sessionID"],
+                    "additionalProperties": false
+                  }
+                },
+                "required": ["id", "type", "properties"],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "pattern": "^evt_"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": ["session.compaction.started"]
+                  },
+                  "properties": {
+                    "type": "object",
+                    "properties": {
+                      "sessionID": {
+                        "type": "string",
+                        "pattern": "^ses"
+                      },
+                      "before_tokens": {
+                        "type": "number"
+                      }
+                    },
+                    "required": ["sessionID", "before_tokens"],
+                    "additionalProperties": false
+                  }
+                },
+                "required": ["id", "type", "properties"],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "pattern": "^evt_"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": ["session.compaction.completed"]
+                  },
+                  "properties": {
+                    "type": "object",
+                    "properties": {
+                      "sessionID": {
+                        "type": "string",
+                        "pattern": "^ses"
+                      },
+                      "before_tokens": {
+                        "type": "number"
+                      },
+                      "after_tokens": {
+                        "type": "number"
+                      }
+                    },
+                    "required": ["sessionID", "before_tokens"],
+                    "additionalProperties": false
+                  }
+                },
+                "required": ["id", "type", "properties"],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "pattern": "^evt_"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": ["session.turn.completed"]
+                  },
+                  "properties": {
+                    "type": "object",
+                    "properties": {
+                      "sessionID": {
+                        "type": "string",
+                        "pattern": "^ses"
+                      },
+                      "status": {
+                        "type": "string",
+                        "enum": ["idle", "error"]
+                      },
+                      "parts_written": {
+                        "type": "number"
+                      },
+                      "last_error": {
+                        "type": "string"
+                      }
+                    },
+                    "required": ["sessionID", "status", "parts_written"],
                     "additionalProperties": false
                   }
                 },
@@ -20930,6 +21228,31 @@
                   "type": "string",
                   "enum": ["alpha", "beta", "deprecated", "active"]
                 },
+                "tier": {
+                  "type": "string",
+                  "enum": ["minimal", "default"],
+                  "description": "Capability tier for this model. Overrides the built-in size heuristic; frontier family models resolve their vendor behavior when unset."
+                },
+                "prompt": {
+                  "type": "string",
+                  "description": "Replace the model-family system prompt with this text. Use {file:./path} to load it from a file resolved relative to the config file."
+                },
+                "sampling": {
+                  "type": "object",
+                  "properties": {
+                    "temperature": {
+                      "type": "number"
+                    },
+                    "topP": {
+                      "type": "number"
+                    },
+                    "topK": {
+                      "type": "number"
+                    }
+                  },
+                  "additionalProperties": false,
+                  "description": "Sampling defaults for this model. Consulted before the built-in per-family sampling ladders."
+                },
                 "provider": {
                   "type": "object",
                   "properties": {
@@ -21514,6 +21837,9 @@
               "reserved": {
                 "type": "integer",
                 "minimum": 0
+              },
+              "prompt": {
+                "type": "string"
               }
             },
             "additionalProperties": false
@@ -21537,6 +21863,9 @@
                 }
               },
               "continue_loop_on_deny": {
+                "type": "boolean"
+              },
+              "omit_model_identity": {
                 "type": "boolean"
               },
               "mcp_timeout": {
@@ -21585,6 +21914,28 @@
           },
           "family": {
             "type": "string"
+          },
+          "tier": {
+            "type": "string",
+            "enum": ["minimal", "default"]
+          },
+          "prompt": {
+            "type": "string"
+          },
+          "sampling": {
+            "type": "object",
+            "properties": {
+              "temperature": {
+                "type": "number"
+              },
+              "topP": {
+                "type": "number"
+              },
+              "topK": {
+                "type": "number"
+              }
+            },
+            "additionalProperties": false
           },
           "capabilities": {
             "type": "object",
@@ -23082,6 +23433,185 @@
           }
         }
       },
+      "SessionContextBudget": {
+        "type": "object",
+        "properties": {
+          "model": {
+            "type": "object",
+            "properties": {
+              "providerID": {
+                "type": "string"
+              },
+              "modelID": {
+                "type": "string"
+              },
+              "limit": {
+                "type": "object",
+                "properties": {
+                  "context": {
+                    "type": "number",
+                    "description": "Context window in tokens as reported by provider/config; 0 when unknown (the engine then assumes a conservative usable window, reflected in `usable`)"
+                  },
+                  "output": {
+                    "type": "number",
+                    "description": "Effective per-request output token cap: configured limit.output or the window-derived fallback"
+                  }
+                },
+                "required": ["context", "output"],
+                "additionalProperties": false
+              },
+              "tier": {
+                "type": "string",
+                "enum": ["minimal", "default", "vendor"],
+                "description": "Resolved capability tier for the model"
+              }
+            },
+            "required": ["providerID", "modelID", "limit", "tier"],
+            "additionalProperties": false
+          },
+          "reserve": {
+            "type": "number",
+            "description": "Compaction reserve in tokens (config override or the proportional formula over the context window); 0 when the model reports no context limit"
+          },
+          "usable": {
+            "type": "number",
+            "description": "The engine's compaction-triggering window in tokens. Depending on which limits the model reports this is input−reserve, context−output budget, or the conservative default for models with no reported limit"
+          },
+          "baseline": {
+            "type": "object",
+            "properties": {
+              "system_prompt": {
+                "type": "object",
+                "properties": {
+                  "chars": {
+                    "type": "number",
+                    "description": "Character count of the serialized content"
+                  },
+                  "est_tokens": {
+                    "type": "number",
+                    "description": "Estimated tokens (chars-based heuristic; re-derive from chars with an exact tokenizer if needed)"
+                  }
+                },
+                "required": ["chars", "est_tokens"],
+                "additionalProperties": false,
+                "description": "Family/tier (or agent) prompt + environment + MCP instructions + skills"
+              },
+              "tools": {
+                "type": "object",
+                "properties": {
+                  "count": {
+                    "type": "number"
+                  },
+                  "chars": {
+                    "type": "number",
+                    "description": "Serialized id + description + provider-transformed JSON schema across the roster"
+                  },
+                  "est_tokens": {
+                    "type": "number"
+                  },
+                  "tools_detail": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string"
+                        },
+                        "chars": {
+                          "type": "number"
+                        },
+                        "est_tokens": {
+                          "type": "number"
+                        }
+                      },
+                      "required": ["id", "chars", "est_tokens"],
+                      "additionalProperties": false
+                    },
+                    "description": "Per-tool serialized cost (id + description + provider-transformed JSON schema)"
+                  }
+                },
+                "required": ["count", "chars", "est_tokens", "tools_detail"],
+                "additionalProperties": false
+              },
+              "instructions": {
+                "type": "object",
+                "properties": {
+                  "chars": {
+                    "type": "number",
+                    "description": "Character count of the serialized content"
+                  },
+                  "est_tokens": {
+                    "type": "number",
+                    "description": "Estimated tokens (chars-based heuristic; re-derive from chars with an exact tokenizer if needed)"
+                  }
+                },
+                "required": ["chars", "est_tokens"],
+                "additionalProperties": false,
+                "description": "Project/global instruction files (AGENTS.md and config instructions)"
+              }
+            },
+            "required": ["system_prompt", "tools", "instructions"],
+            "additionalProperties": false,
+            "description": "What every request pays before history"
+          },
+          "history": {
+            "type": "object",
+            "properties": {
+              "est_tokens": {
+                "type": "number",
+                "description": "Estimate over the projected (post-compaction-filter) message window"
+              },
+              "last_reported": {
+                "type": "object",
+                "properties": {
+                  "input": {
+                    "type": "number"
+                  },
+                  "output": {
+                    "type": "number"
+                  },
+                  "cache_read": {
+                    "type": "number"
+                  },
+                  "total": {
+                    "type": "number"
+                  }
+                },
+                "required": ["input", "output", "cache_read", "total"],
+                "additionalProperties": false,
+                "description": "Provider-reported usage from the most recent finished assistant message"
+              },
+              "messages": {
+                "type": "number",
+                "description": "Messages in the projected window"
+              },
+              "post_compaction": {
+                "type": "boolean",
+                "description": "Whether the session has at least one completed compaction"
+              }
+            },
+            "required": ["est_tokens", "messages", "post_compaction"],
+            "additionalProperties": false
+          },
+          "next_request": {
+            "type": "object",
+            "properties": {
+              "est_input_tokens": {
+                "type": "number",
+                "description": "Sum of baseline components and history est_tokens"
+              },
+              "headroom": {
+                "type": "number",
+                "description": "usable − est_input_tokens; negative when the next request is projected to overflow"
+              }
+            },
+            "required": ["est_input_tokens", "headroom"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["model", "reserve", "usable", "baseline", "history", "next_request"],
+        "additionalProperties": false
+      },
       "TextPartInput": {
         "type": "object",
         "properties": {
@@ -24240,7 +24770,25 @@
             "$ref": "#/components/schemas/question.rejected"
           },
           {
+            "$ref": "#/components/schemas/SessionOverflowDetected"
+          },
+          {
+            "$ref": "#/components/schemas/SessionOutputClamped"
+          },
+          {
+            "$ref": "#/components/schemas/SessionToolStripped"
+          },
+          {
             "$ref": "#/components/schemas/SessionCompacted"
+          },
+          {
+            "$ref": "#/components/schemas/SessionCompactionStarted"
+          },
+          {
+            "$ref": "#/components/schemas/SessionCompactionCompleted"
+          },
+          {
+            "$ref": "#/components/schemas/SessionTurnCompleted"
           },
           {
             "$ref": "#/components/schemas/VcsBranchUpdated"
@@ -31656,6 +32204,9 @@
                     "$ref": "#/components/schemas/APIError"
                   }
                 ]
+              },
+              "parts_written": {
+                "type": "number"
               }
             },
             "additionalProperties": false
@@ -33281,6 +33832,172 @@
         "required": ["id", "type", "data"],
         "additionalProperties": false
       },
+      "SessionOverflowDetected": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^evt_"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["session.overflow.detected"]
+          },
+          "durable": {
+            "type": "object",
+            "properties": {
+              "aggregateID": {
+                "type": "string"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "version": {
+                "type": "integer"
+              }
+            },
+            "required": ["aggregateID", "seq", "version"],
+            "additionalProperties": false
+          },
+          "location": {
+            "$ref": "#/components/schemas/LocationRef"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "sessionID": {
+                "type": "string",
+                "pattern": "^ses"
+              },
+              "tokens": {
+                "type": "number"
+              },
+              "usable": {
+                "type": "number"
+              },
+              "reserve": {
+                "type": "number"
+              },
+              "action": {
+                "type": "string",
+                "enum": ["compact"]
+              }
+            },
+            "required": ["sessionID", "tokens", "usable", "reserve", "action"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "data"],
+        "additionalProperties": false
+      },
+      "SessionOutputClamped": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^evt_"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["session.output.clamped"]
+          },
+          "durable": {
+            "type": "object",
+            "properties": {
+              "aggregateID": {
+                "type": "string"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "version": {
+                "type": "integer"
+              }
+            },
+            "required": ["aggregateID", "seq", "version"],
+            "additionalProperties": false
+          },
+          "location": {
+            "$ref": "#/components/schemas/LocationRef"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "sessionID": {
+                "type": "string",
+                "pattern": "^ses"
+              },
+              "requested": {
+                "type": "number"
+              },
+              "granted": {
+                "type": "number"
+              }
+            },
+            "required": ["sessionID", "requested", "granted"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "data"],
+        "additionalProperties": false
+      },
+      "SessionToolStripped": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^evt_"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["session.tool.stripped"]
+          },
+          "durable": {
+            "type": "object",
+            "properties": {
+              "aggregateID": {
+                "type": "string"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "version": {
+                "type": "integer"
+              }
+            },
+            "required": ["aggregateID", "seq", "version"],
+            "additionalProperties": false
+          },
+          "location": {
+            "$ref": "#/components/schemas/LocationRef"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "sessionID": {
+                "type": "string",
+                "pattern": "^ses"
+              },
+              "tool": {
+                "type": "string"
+              }
+            },
+            "required": ["sessionID", "tool"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "data"],
+        "additionalProperties": false
+      },
       "SessionCompacted": {
         "type": "object",
         "properties": {
@@ -33323,6 +34040,169 @@
               }
             },
             "required": ["sessionID"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "data"],
+        "additionalProperties": false
+      },
+      "SessionCompactionStarted": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^evt_"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["session.compaction.started"]
+          },
+          "durable": {
+            "type": "object",
+            "properties": {
+              "aggregateID": {
+                "type": "string"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "version": {
+                "type": "integer"
+              }
+            },
+            "required": ["aggregateID", "seq", "version"],
+            "additionalProperties": false
+          },
+          "location": {
+            "$ref": "#/components/schemas/LocationRef"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "sessionID": {
+                "type": "string",
+                "pattern": "^ses"
+              },
+              "before_tokens": {
+                "type": "number"
+              }
+            },
+            "required": ["sessionID", "before_tokens"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "data"],
+        "additionalProperties": false
+      },
+      "SessionCompactionCompleted": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^evt_"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["session.compaction.completed"]
+          },
+          "durable": {
+            "type": "object",
+            "properties": {
+              "aggregateID": {
+                "type": "string"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "version": {
+                "type": "integer"
+              }
+            },
+            "required": ["aggregateID", "seq", "version"],
+            "additionalProperties": false
+          },
+          "location": {
+            "$ref": "#/components/schemas/LocationRef"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "sessionID": {
+                "type": "string",
+                "pattern": "^ses"
+              },
+              "before_tokens": {
+                "type": "number"
+              },
+              "after_tokens": {
+                "type": "number"
+              }
+            },
+            "required": ["sessionID", "before_tokens"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "data"],
+        "additionalProperties": false
+      },
+      "SessionTurnCompleted": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^evt_"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["session.turn.completed"]
+          },
+          "durable": {
+            "type": "object",
+            "properties": {
+              "aggregateID": {
+                "type": "string"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "version": {
+                "type": "integer"
+              }
+            },
+            "required": ["aggregateID", "seq", "version"],
+            "additionalProperties": false
+          },
+          "location": {
+            "$ref": "#/components/schemas/LocationRef"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "sessionID": {
+                "type": "string",
+                "pattern": "^ses"
+              },
+              "status": {
+                "type": "string",
+                "enum": ["idle", "error"]
+              },
+              "parts_written": {
+                "type": "number"
+              },
+              "last_error": {
+                "type": "string"
+              }
+            },
+            "required": ["sessionID", "status", "parts_written"],
             "additionalProperties": false
           }
         },
@@ -35537,6 +36417,9 @@
                     "$ref": "#/components/schemas/APIError"
                   }
                 ]
+              },
+              "parts_written": {
+                "type": "number"
               }
             },
             "additionalProperties": false
@@ -36459,6 +37342,106 @@
         "required": ["id", "type", "properties"],
         "additionalProperties": false
       },
+      "EventSessionOverflowDetected": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^evt_"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["session.overflow.detected"]
+          },
+          "properties": {
+            "type": "object",
+            "properties": {
+              "sessionID": {
+                "type": "string",
+                "pattern": "^ses"
+              },
+              "tokens": {
+                "type": "number"
+              },
+              "usable": {
+                "type": "number"
+              },
+              "reserve": {
+                "type": "number"
+              },
+              "action": {
+                "type": "string",
+                "enum": ["compact"]
+              }
+            },
+            "required": ["sessionID", "tokens", "usable", "reserve", "action"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "properties"],
+        "additionalProperties": false
+      },
+      "EventSessionOutputClamped": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^evt_"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["session.output.clamped"]
+          },
+          "properties": {
+            "type": "object",
+            "properties": {
+              "sessionID": {
+                "type": "string",
+                "pattern": "^ses"
+              },
+              "requested": {
+                "type": "number"
+              },
+              "granted": {
+                "type": "number"
+              }
+            },
+            "required": ["sessionID", "requested", "granted"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "properties"],
+        "additionalProperties": false
+      },
+      "EventSessionToolStripped": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^evt_"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["session.tool.stripped"]
+          },
+          "properties": {
+            "type": "object",
+            "properties": {
+              "sessionID": {
+                "type": "string",
+                "pattern": "^ses"
+              },
+              "tool": {
+                "type": "string"
+              }
+            },
+            "required": ["sessionID", "tool"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "properties"],
+        "additionalProperties": false
+      },
       "EventSessionCompacted": {
         "type": "object",
         "properties": {
@@ -36479,6 +37462,103 @@
               }
             },
             "required": ["sessionID"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "properties"],
+        "additionalProperties": false
+      },
+      "EventSessionCompactionStarted": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^evt_"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["session.compaction.started"]
+          },
+          "properties": {
+            "type": "object",
+            "properties": {
+              "sessionID": {
+                "type": "string",
+                "pattern": "^ses"
+              },
+              "before_tokens": {
+                "type": "number"
+              }
+            },
+            "required": ["sessionID", "before_tokens"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "properties"],
+        "additionalProperties": false
+      },
+      "EventSessionCompactionCompleted": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^evt_"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["session.compaction.completed"]
+          },
+          "properties": {
+            "type": "object",
+            "properties": {
+              "sessionID": {
+                "type": "string",
+                "pattern": "^ses"
+              },
+              "before_tokens": {
+                "type": "number"
+              },
+              "after_tokens": {
+                "type": "number"
+              }
+            },
+            "required": ["sessionID", "before_tokens"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "properties"],
+        "additionalProperties": false
+      },
+      "EventSessionTurnCompleted": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^evt_"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["session.turn.completed"]
+          },
+          "properties": {
+            "type": "object",
+            "properties": {
+              "sessionID": {
+                "type": "string",
+                "pattern": "^ses"
+              },
+              "status": {
+                "type": "string",
+                "enum": ["idle", "error"]
+              },
+              "parts_written": {
+                "type": "number"
+              },
+              "last_error": {
+                "type": "string"
+              }
+            },
+            "required": ["sessionID", "status", "parts_written"],
             "additionalProperties": false
           }
         },

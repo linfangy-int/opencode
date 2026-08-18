@@ -5,6 +5,8 @@ import { InstanceState } from "@/effect/instance-state"
 
 import PROMPT_ANTHROPIC from "./prompt/anthropic.txt"
 import PROMPT_DEFAULT from "./prompt/default.txt"
+import PROMPT_DEFAULT_COMPACT from "./prompt/default-compact.txt"
+import PROMPT_MINIMAL from "./prompt/minimal.txt"
 import PROMPT_BEAST from "./prompt/beast.txt"
 import PROMPT_GEMINI from "./prompt/gemini.txt"
 import PROMPT_GPT from "./prompt/gpt.txt"
@@ -13,6 +15,7 @@ import PROMPT_META from "./prompt/meta.txt"
 
 import PROMPT_CODEX from "./prompt/codex.txt"
 import PROMPT_TRINITY from "./prompt/trinity.txt"
+import { SessionTier } from "./tier"
 import type { Provider } from "@/provider/provider"
 import type { Agent } from "@/agent/agent"
 import { Permission } from "@/permission"
@@ -22,9 +25,14 @@ import { Location } from "@opencode-ai/core/location"
 import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
 import { Reference } from "@opencode-ai/core/reference"
 import { MCP } from "@/mcp"
+import { Config } from "@/config/config"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 
 export function provider(model: Provider.Model) {
+  if (model.prompt) return [model.prompt]
+  const tier = SessionTier.resolve(model)
+  if (tier === "minimal") return [PROMPT_MINIMAL]
+  if (tier === "default") return [PROMPT_DEFAULT_COMPACT]
   if (model.api.id.includes("muse")) {
     const name = model.api.id.includes("muse-glimmer") ? "Muse Glimmer" : "Muse Spark"
     return [PROMPT_META.replaceAll("{{MODEL_NAME}}", name)]
@@ -62,23 +70,38 @@ const layer = Layer.effect(
     const skill = yield* Skill.Service
     const mcp = yield* MCP.Service
     const locations = yield* LocationServiceMap.Service
+    const config = yield* Config.Service
 
     return Service.of({
       environment: Effect.fn("SystemPrompt.environment")(function* (model: Provider.Model) {
         const ctx = yield* InstanceState.context
+        const cfg = yield* config.get()
+        const tier = SessionTier.resolve(model)
+        // E3: the identity line costs prompt tokens and leaks the serving
+        // model. Config can turn it off anywhere; the minimal tier omits it
+        // by default (part of the C3 baseline budget).
+        const omitIdentity = cfg.experimental?.omit_model_identity ?? tier === "minimal"
         const references = yield* Effect.gen(function* () {
           return (yield* (yield* Reference.Service).list()).filter((reference) => reference.description !== undefined)
         }).pipe(Effect.provide(locations.get(Location.Ref.make({ directory: AbsolutePath.make(ctx.directory) }))))
         return [
           [
-            `You are powered by the model named ${model.api.id}. The exact model ID is ${model.providerID}/${model.api.id}`,
+            ...(omitIdentity
+              ? []
+              : [
+                  `You are powered by the model named ${model.api.id}. The exact model ID is ${model.providerID}/${model.api.id}`,
+                ]),
             `Here is some useful information about the environment you are running in:`,
             `<env>`,
             `  Working directory: ${ctx.directory}`,
             `  Workspace root folder: ${ctx.worktree}`,
             `  Is directory a git repo: ${ctx.project.vcs === "git" ? "yes" : "no"}`,
             `  Platform: ${process.platform}`,
-            `  Today's date: ${new Date().toDateString()}`,
+            // E6: the volatile date line invalidates the prompt-cache prefix
+            // daily. Minimal/default tiers carry it as a trailing system
+            // message instead (request prep appends it); vendor tiers keep
+            // it here byte-identical.
+            ...(tier === "vendor" ? [`  Today's date: ${new Date().toDateString()}`] : []),
             `</env>`,
           ].join("\n"),
           references.length === 0
@@ -146,7 +169,7 @@ const locationServiceMapNode = LayerNode.make({
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
-  deps: [Skill.node, MCP.node, locationServiceMapNode],
+  deps: [Skill.node, MCP.node, locationServiceMapNode, Config.node],
 })
 
 export * as SystemPrompt from "./system"

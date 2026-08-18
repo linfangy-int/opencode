@@ -4,6 +4,7 @@ import type { JSONSchema7 } from "@ai-sdk/provider"
 import type * as Provider from "./provider"
 import type * as ModelsDev from "@opencode-ai/core/models-dev"
 import { iife } from "@/util/iife"
+import { SessionTier } from "@/session/tier"
 
 type Modality = NonNullable<ModelsDev.Model["modalities"]>["input"][number]
 
@@ -525,7 +526,24 @@ const GEMINI_MODELS_WITH_SAMPLING_DEFAULTS = [
   /gemini-3[.-]5-flash(?!-lite)(?:[.-]|$)/,
 ]
 
+// Tier sampling defaults for small local models; matches the llama.cpp launch
+// tuning so engine and server agree. Minimal tier pins these ahead of the
+// substring ladders; default tier uses them only when the ladder has no entry.
+const TIER_SAMPLING = { temperature: 0.1, topP: 0.95, topK: 20 }
+
+// Sampling only honors a tier backed by positive evidence — explicit config or
+// a parameter-count match. Bare fall-through models (unknown cloud ids like
+// deepseek-v4-flash) keep the upstream ladder outputs untouched.
+function tierForSampling(model: Provider.Model) {
+  const detected = SessionTier.detect(model)
+  if (detected.source === "config" || detected.source === "heuristic") return detected.tier
+  return undefined
+}
+
 export function temperature(model: Provider.Model) {
+  if (model.sampling?.temperature !== undefined) return model.sampling.temperature
+  const tier = tierForSampling(model)
+  if (tier === "minimal") return TIER_SAMPLING.temperature
   const id = model.api.id.toLowerCase()
   if (id.includes("north-mini-code")) return 1.0
   if (id.includes("qwen")) return 0.55
@@ -542,10 +560,14 @@ export function temperature(model: Provider.Model) {
     }
     return 0.6
   }
+  if (tier === "default") return TIER_SAMPLING.temperature
   return undefined
 }
 
 export function topP(model: Provider.Model) {
+  if (model.sampling?.topP !== undefined) return model.sampling.topP
+  const tier = tierForSampling(model)
+  if (tier === "minimal") return TIER_SAMPLING.topP
   const id = model.api.id.toLowerCase()
   if (id.includes("qwen")) return 1
   if (id.includes("gemini"))
@@ -559,10 +581,14 @@ export function topP(model: Provider.Model) {
   ) {
     return 0.95
   }
+  if (tier === "default") return TIER_SAMPLING.topP
   return undefined
 }
 
 export function topK(model: Provider.Model) {
+  if (model.sampling?.topK !== undefined) return model.sampling.topK
+  const tier = tierForSampling(model)
+  if (tier === "minimal") return TIER_SAMPLING.topK
   const id = model.api.id.toLowerCase()
   if (id.includes("minimax-m2")) {
     if (["m2.", "m25", "m21"].some((s) => id.includes(s))) return 40
@@ -570,6 +596,7 @@ export function topK(model: Provider.Model) {
   }
   if (id.includes("gemini"))
     return GEMINI_MODELS_WITH_SAMPLING_DEFAULTS.some((model) => model.test(id)) ? 64 : undefined
+  if (tier === "default") return TIER_SAMPLING.topK
   return undefined
 }
 
@@ -1418,7 +1445,14 @@ export function providerOptions(model: Provider.Model, options: { [x: string]: a
 }
 
 export function maxOutputTokens(model: Provider.Model, outputTokenMax = OUTPUT_TOKEN_MAX): number {
-  return Math.min(model.limit.output, outputTokenMax) || outputTokenMax
+  const capped = Math.min(model.limit.output, outputTokenMax)
+  if (capped) return capped
+  // Unset limit.output: derive a window-proportional fallback so small
+  // windows don't reserve most of the context for output. When limit.context
+  // is also unset, keep the flat fallback — the overflow layer applies its
+  // own conservative default and it must not be double-applied here.
+  if (!model.limit.context) return outputTokenMax
+  return Math.min(outputTokenMax, Math.max(1_024, Math.floor(model.limit.context * 0.25)))
 }
 
 type JsonRecord = Record<string, unknown>
@@ -1511,7 +1545,73 @@ function sanitizeOpenAISchema(value: unknown): unknown {
   return result
 }
 
+// Grammar-safe lowering for small local models (llama.cpp converts the whole
+// tools[] union to GBNF and 400s on unsupported keywords). Extends
+// sanitizeOpenAISchema with: $ref/$defs inlining, anyOf/oneOf/allOf flattening
+// to the first non-null variant, boolean-only additionalProperties, and typed
+// single-object items. `format`/`pattern` are already dropped because
+// sanitizeOpenAISchema only copies whitelisted keys.
+export function sanitizeGrammarSafeSchema(schema: JSONSchema7): JSONSchema7 {
+  const root = schema as unknown as JsonRecord
+  const defs = {
+    ...(isPlainObject(root.$defs) ? root.$defs : {}),
+    ...(isPlainObject(root.definitions) ? root.definitions : {}),
+  }
+
+  const inline = (value: unknown, seen: string[]): unknown => {
+    if (Array.isArray(value)) return value.map((item) => inline(item, seen))
+    if (!isPlainObject(value)) return value
+    if (typeof value.$ref === "string") {
+      const name = value.$ref.split("/").at(-1) ?? ""
+      const target = defs[name]
+      // Cyclic or unresolvable refs collapse to a permissive object.
+      if (!isPlainObject(target) || seen.includes(name)) return { type: "object", additionalProperties: true }
+      const description = typeof value.description === "string" ? { description: value.description } : {}
+      return inline({ ...target, ...description }, [...seen, name])
+    }
+    return Object.fromEntries(
+      Object.entries(value)
+        .filter(([key]) => key !== "$defs" && key !== "definitions")
+        .map(([key, item]) => [key, inline(item, seen)]),
+    )
+  }
+
+  const compositionKeys = ["anyOf", "oneOf", "allOf"]
+  const lower = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(lower)
+    if (!isPlainObject(value)) return value
+    const flattened = iife(() => {
+      const variants = compositionKeys.flatMap((key) => (Array.isArray(value[key]) ? value[key] : []))
+      if (variants.length === 0) return value
+      const first = variants.find((item) => isPlainObject(item) && item.type !== "null") ?? variants[0]
+      const rest = Object.fromEntries(Object.entries(value).filter(([key]) => !compositionKeys.includes(key)))
+      return isPlainObject(first) ? { ...rest, ...first } : rest
+    })
+    // The chosen variant may itself carry a composition — flatten again until none remain.
+    if (compositionKeys.some((key) => Array.isArray(flattened[key])) && flattened !== value) return lower(flattened)
+    const result = Object.fromEntries(Object.entries(flattened).map(([key, item]) => [key, lower(item)]))
+    if ("additionalProperties" in result && typeof result.additionalProperties !== "boolean") {
+      result.additionalProperties = true
+    }
+    if (Array.isArray(result.items)) result.items = result.items[0] ?? { type: "string" }
+    if (isPlainObject(result.items) && result.items.type === undefined) {
+      result.items = { type: "string", ...result.items }
+    }
+    return result
+  }
+
+  const sanitized = lower(sanitizeOpenAISchema(inline(root, [])))
+  if (isPlainObject(sanitized)) return sanitized as JSONSchema7
+  return { type: "object", properties: {} }
+}
+
 export function schema(model: Provider.Model, schema: JSONSchema7): JSONSchema7 {
+  // Small-model tiers get the full grammar-safe lowering. Vendor-family ids
+  // (claude/gpt/gemini/kimi) never resolve to these tiers, so their schemas
+  // stay byte-identical — including kimi served over @ai-sdk/openai-compatible.
+  const tier = SessionTier.resolve(model)
+  if (tier === "minimal" || tier === "default") return sanitizeGrammarSafeSchema(schema)
+
   /*
   if (["openai", "azure"].includes(providerID)) {
     if (schema.type === "object" && schema.properties) {
